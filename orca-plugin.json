@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "beads",
   "name": "Beads 看板",
-  "version": "0.2.5-ssh.6",
+  "version": "0.2.5-ssh.7",
   "description": "Beads 看板、交接预览、文档和个人历史。支持本地工作区，以及主机名就是 ~/.ssh/config 别名的 SSH 工作区。",
   "author": { "name": "Roflochinsky" },
   "repository": "https://github.com/Roflochinsky/beads-orca",

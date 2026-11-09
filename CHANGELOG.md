@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5-ssh.7 — 2026-11-09
+
+- Reopening the panel selects the workspace Orca currently has focused. The last manual choice is used only when that focus is missing or matches more than one workspace.
+- New CLI sessions offer Grok, Claude, Codex, Qoder CLI, OMP, Antigravity, Cursor, and Droid, using each tool's real binary name. Amp is not listed.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.6 — 2026-11-09
 
 - The Simplified Chinese label for Beads type `epic` is 需求. Section headers, search, filters, and empty states use the same word. The value sent to `bd` stays `epic`.

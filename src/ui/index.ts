@@ -1,5 +1,6 @@
 import type { Issue, Project, Snapshot, Transport } from '../shared.js';
 import { relationLabel, statusLabel, syncPanelLocale, t, typeLabel } from './i18n.js';
+import { preferredProjectId } from './project-selection.js';
 import { icon } from './icons.js';
 import { createProductUI } from './product.js';
 import { createIssueModel, issueGroupOrder, portableHostName, resolveEpicProject, selectIssues, virtualRange } from './model.js';
@@ -32,6 +33,14 @@ const typeIcons: Record<string, string> = {
 };
 const editFields: Array<keyof EditValues> = ['title', 'description', 'priority', 'assignee', 'notes', 'acceptance', 'design'];
 const cleanups = new WeakMap<HTMLElement, () => void>();
+const LAST_PROJECT_KEY = 'beads-orca.lastProject';
+function rememberedProject(): string {
+  try { return globalThis.localStorage?.getItem(LAST_PROJECT_KEY) || ''; } catch { return ''; }
+}
+function rememberProject(id: string): void {
+  if (!id) return;
+  try { globalThis.localStorage?.setItem(LAST_PROJECT_KEY, id); } catch { /* The panel can still follow the focused workspace. */ }
+}
 const emptyDraft = (): Draft => ({ title: '', description: '', type: 'task', priority: '2', assignee: '', labels: '' });
 const escapeHtml = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c);
 const shell = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
@@ -781,14 +790,15 @@ export function mount(root: HTMLElement, transport: Transport): void {
             armRefresh();
           }
         } catch { pathErrors = []; }
-        if (!projects.some((project) => project.id === projectId)) {
-          const current = projects.filter((project) => project.current);
-          projectId = (!projectId && current.length === 1 ? current[0]?.id : undefined) || projects[0]?.id || '';
+        const nextProject = preferredProjectId(projects, rememberedProject(), projectId);
+        if (nextProject !== projectId) {
+          projectId = nextProject;
           snapshot = null; issueIndex.clear(); blockedIds.clear();
           model = null; modelSignature = ''; modelVersion++; epicFilter = undefined; resetEpicListFilters();
           selectedId = ''; detail = null; detailSequence++; commentsSequence++;
           comments = []; commentsError = ''; undoClose = null;
         }
+        if (projectId) rememberProject(projectId);
         loadingProjects = false;
         if (projectId) await refresh();
         else { snapshot = null; render(); }
@@ -1029,7 +1039,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const project = projects.find((item) => item.id === id);
     if (!project || id === projectId) return;
     if (!inScope(project, scope)) { actionError = t("This project is outside the saved filter scope. Clear filters to view it.", "这个项目不在已保存的筛选里。清除筛选后再看。"); render(); return; }
-    projectId = id; snapshot = null; issueIndex.clear(); blockedIds.clear();
+    projectId = id; rememberProject(id); snapshot = null; issueIndex.clear(); blockedIds.clear();
     model = null; modelSignature = ''; modelVersion++; resetEpicListFilters(); if (!preserveEpic) epicFilter = undefined;
     loadingSnapshot = true; connectionLost = false; selectedId = ''; detail = null; detailSequence++; commentsSequence++;
     comments = []; commentsError = ''; commentsLoading = false; undoClose = null;
@@ -1440,9 +1450,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
   }
 
   function onVisibility(): void {
-    if (!document.hidden && !pending && !drag && !refreshTask && !loadingProjects) {
-      if (projectId) void refresh(); else void loadProjects();
-    }
+    if (!document.hidden && !pending && !drag && !refreshTask && !loadingProjects) void loadProjects();
   }
   function onScroll(event: Event): void {
     if (event.target instanceof HTMLElement && event.target.dataset.windowContainer) scheduleWindows();

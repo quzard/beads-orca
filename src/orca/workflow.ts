@@ -10,7 +10,17 @@ import type { AgentDiscovery, HandoffGroup, HandoffPreview, HistoryEntry, Worktr
 
 export type WorkflowAccess = Pick<ProjectAccess, 'list' | 'request' | 'readText' | 'writeText' | 'removeFile' | 'executableAvailable' | 'captureIdentity' | 'inspectFile'>;
 const METHODS: Record<string, true> = { 'agents.list': true, 'handoff.preview': true, 'handoff.send': true, 'history.list': true, 'history.get': true, 'history.delete': true, 'history.export': true, 'history.import': true, 'history.import.begin': true, 'history.import.chunk': true, 'history.import.finish': true, 'handoff.report': true, 'handoff.openChange': true, 'handoff.cleanup': true, 'history.publish': true, 'workspace.open': true, 'worktree.preview': true, 'worktree.create': true };
-const PROVIDERS = ['claude', 'codex', 'omp', 'pi', 'grok', 'gemini', 'opencode', 'amp', 'aider', 'goose', 'copilot'] as const;
+/** Orca `agent launch --agent` ids. `commands` are the binaries Orca probes, which are not always the id. */
+const PROVIDERS: ReadonlyArray<{ id: string; name: string; commands: readonly string[] }> = [
+  { id: 'grok', name: 'Grok', commands: ['grok'] },
+  { id: 'claude', name: 'Claude', commands: ['claude'] },
+  { id: 'codex', name: 'Codex', commands: ['codex'] },
+  { id: 'qoder', name: 'Qoder CLI', commands: ['qodercli', 'qoder'] },
+  { id: 'omp', name: 'OMP', commands: ['omp'] },
+  { id: 'antigravity', name: 'Antigravity', commands: ['agy'] },
+  { id: 'cursor', name: 'Cursor', commands: ['cursor-agent'] },
+  { id: 'droid', name: 'Droid', commands: ['droid'] },
+];
 const now = () => new Date().toISOString();
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const hostOf = (project: Project) => project.hostId || 'local';
@@ -176,7 +186,13 @@ export class WorkflowService {
       sessions.push({ terminal: terminal.handle, agent: terminal.agentIdentity, state: terminal.connected !== true ? 'unavailable' : typeof state === 'string' ? state : 'unknown', workspace: target.id, host: hostOf(target), sendable: false, reason: EXISTING_SESSION_REASON });
     }
     const providers: AgentDiscovery['providers'] = [];
-    for (const id of PROVIDERS) if (await this.access.executableAvailable(target.id, id)) providers.push({ id, name: id });
+    for (const provider of PROVIDERS) {
+      let installed = false;
+      for (const command of provider.commands) {
+        if (await this.access.executableAvailable(target.id, command)) { installed = true; break; }
+      }
+      if (installed) providers.push({ id: provider.id, name: provider.name });
+    }
     return { sessions, providers, warnings, identity: hash({ id: native.id, identity: native.identity, path: native.path, host: native.hostId }) };
   }
   private async preview(group: HandoffGroup, id: string = randomUUID(), createdAt = now()): Promise<HandoffPreview> {
