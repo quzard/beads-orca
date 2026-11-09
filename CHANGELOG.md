@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5-ssh.6 — 2026-11-09
+
+- The Simplified Chinese label for Beads type `epic` is 需求. Section headers, search, filters, and empty states use the same word. The value sent to `bd` stays `epic`.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.5 — 2026-11-09
 
 - Remaining panel chrome is Simplified Chinese: issue types, statuses, relationships, filters, empty states, buttons, and the errors the panel shows. Values sent to `bd` stay the English keys.

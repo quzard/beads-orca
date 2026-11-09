@@ -81,7 +81,7 @@ export function typeLabel(type: string): string {
     case 'bug': return t('bug', '缺陷');
     case 'feature': return t('feature', '功能');
     case 'chore': return t('chore', '杂项');
-    case 'epic': return t('epic', '史诗');
+    case 'epic': return t('epic', '需求');
     case 'decision': return t('decision', '决策');
     case 'spike': return t('spike', '预研');
     case 'story': return t('story', '故事');

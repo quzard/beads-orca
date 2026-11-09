@@ -190,12 +190,12 @@ export function mount(root: HTMLElement, transport: Transport): void {
     applyCriteria: (criteria) => {
       const epicResolution = criteria.epic ? resolveEpicProject(projects, criteria.epic) : null;
       if (epicResolution && epicResolution.kind !== 'matched') {
-        actionError = epicResolution.kind === 'ambiguous' ? t("The saved epic matches multiple registered projects. Resolve the ambiguity before applying it.", "这个史诗对上了多个项目，先处理完再应用。") : t("No registered project matches the saved epic’s project and host.", "没有项目同时对上这个史诗的项目和主机。");
+        actionError = epicResolution.kind === 'ambiguous' ? t("The saved epic matches multiple registered projects. Resolve the ambiguity before applying it.", "这个需求对上了多个项目，先处理完再应用。") : t("No registered project matches the saved epic’s project and host.", "没有项目同时对上这个需求的项目和主机。");
         return;
       }
       const match = epicResolution?.kind === 'matched' ? epicResolution.project : projects.find((project) => project.id === projectId && inScope(project, criteria))
         || projects.find((project) => inScope(project, criteria));
-      if (match && !inScope(match, criteria)) { actionError = t("The saved epic project is outside this filter scope.", "史诗所在项目不在当前筛选里。"); return; }
+      if (match && !inScope(match, criteria)) { actionError = t("The saved epic project is outside this filter scope.", "需求所在项目不在当前筛选里。"); return; }
       if ((criteria.projectNames.length || criteria.hostNames.length) && !match) { actionError = t("No available project matches this filter scope.", "没有项目落在这个筛选里。"); return; }
       scope = { projectNames: [...criteria.projectNames], hostNames: [...criteria.hostNames] };
       query = criteria.query; view = criteria.view; layout = criteria.layout; typeFilter = criteria.typeFilter;
@@ -308,7 +308,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
   }
   function tableContent(issues: Issue[]): string {
     const headers: Array<[SortKey, string]> = [
-      ['title', t("Title", "标题")], ['status', t("Status", "状态")], ['priority', t("Priority", "优先级")], ['epic', t("Epic", "史诗")],
+      ['title', t("Title", "标题")], ['status', t("Status", "状态")], ['priority', t("Priority", "优先级")], ['epic', t("Epic", "需求")],
       ['assignee', t("Assignee", "负责人")], ['type', t("Type", "类型")], ['relationships', t("Relationships", "关系")], ['labels', t("Labels", "标签")], ['updated', t("Updated", "更新")],
     ];
     const value = (issue: Issue): string | number => {
@@ -501,33 +501,33 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const assignees = [...new Set(epics.map((epic) => epic.assignee).filter(Boolean))].sort();
     const knownStatuses = ['open', 'in_progress', 'blocked', 'deferred', 'closed'];
     const statuses = [...new Set([...knownStatuses, ...epics.map((epic) => epic.status)])];
-    const epicOptions = `<option value="all"${selected(epicValue, 'all')}>${t("All epics", "全部史诗")}</option><option value="none"${selected(epicValue, 'none')}>${t("No epic", "无史诗")}</option>${options.map((epic) => `<option value="id:${escapeHtml(epic.id)}"${selected(epicValue, `id:${epic.id}`)}>${escapeHtml(epic.title)} · ${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? t(" (outside filters)", "（不在筛选里）") : ''}</option>`).join('')}`;
+    const epicOptions = `<option value="all"${selected(epicValue, 'all')}>${t("All epics", "全部需求")}</option><option value="none"${selected(epicValue, 'none')}>${t("No epic", "无需求")}</option>${options.map((epic) => `<option value="id:${escapeHtml(epic.id)}"${selected(epicValue, `id:${epic.id}`)}>${escapeHtml(epic.title)} · ${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? t(" (outside filters)", "（不在筛选里）") : ''}</option>`).join('')}`;
     return `<nav class="rail" aria-label="${t("Workspace", "工作区")}">
       <div class="rail__workspace"><span class="rail__glyph">${escapeHtml((project ? projectBasename(project) : 'B').slice(0, 2).toLocaleLowerCase())}</span><div>${projectSelect()}</div></div>
       <div class="rail__create">${createButton()}</div>
       <label class="rail__view"><span class="visually-hidden">${t("Issue view", "议题视图")}</span><select data-change="view" data-focus="view" aria-label="${t("Issue view", "议题视图")}">${groups.map((group) => `<option value="${group}"${selected(view, group)}>${group === 'all' ? t("All issues", "全部议题") : escapeHtml(groupLabel(group))}</option>`).join('')}</select></label>
       <h2 class="rail__heading">${t("Views", "视图")}</h2>
       ${groups.map((group) => `<button type="button" class="rail__item" data-action="view" data-value="${group}" aria-current="${pressed(view === group)}">${group === 'all' ? icon('view_kanban') : bead(group)}<span>${group === 'all' ? t("All issues", "全部议题") : escapeHtml(groupLabel(group))}</span><span class="rail__count">${snapshot ? count(group) : '—'}</span></button>`).join('')}
-      <section class="rail__epics" aria-label="${t("Epics", "史诗")}">
-        <div class="rail__epic-heading"><h2>${t("Epics", "史诗")}</h2><button class="btn btn--text btn--sm" type="button" data-action="toggle-epic-filters" data-focus="toggle-epic-filters" aria-label="${t("Filter epic list", "筛选史诗列表")}${active ? `, ${active}${t(" active", " 项")}` : ''}" aria-expanded="${pressed(epicFiltersExpanded)}" aria-controls="epic-list-filters">${t("Filters", "筛选")}${active ? ` · ${active}` : ''}${icon('arrow_drop_down')}</button></div>
+      <section class="rail__epics" aria-label="${t("Epics", "需求")}">
+        <div class="rail__epic-heading"><h2>${t("Epics", "需求")}</h2><button class="btn btn--text btn--sm" type="button" data-action="toggle-epic-filters" data-focus="toggle-epic-filters" aria-label="${t("Filter epic list", "筛选需求列表")}${active ? `, ${active}${t(" active", " 项")}` : ''}" aria-expanded="${pressed(epicFiltersExpanded)}" aria-controls="epic-list-filters">${t("Filters", "筛选")}${active ? ` · ${active}` : ''}${icon('arrow_drop_down')}</button></div>
         <div class="rail__epic-controls">
-          <label class="rail__epic-search"><span class="visually-hidden">${t("Search epics", "搜索史诗")}</span><input type="search" data-input="epic-search" data-focus="epic-search" placeholder="${t("Search epics", "搜索史诗")}" aria-label="${t("Search epics", "搜索史诗")}" value="${escapeHtml(epicSearch)}"></label>
-          <label class="rail__epic-picker"><span class="visually-hidden">${t("Epic", "史诗")}</span><select data-change="epic" data-focus="epic-mobile" aria-label="${t("Epic", "史诗")}">${epicOptions}</select></label>
+          <label class="rail__epic-search"><span class="visually-hidden">${t("Search epics", "搜索需求")}</span><input type="search" data-input="epic-search" data-focus="epic-search" placeholder="${t("Search epics", "搜索需求")}" aria-label="${t("Search epics", "搜索需求")}" value="${escapeHtml(epicSearch)}"></label>
+          <label class="rail__epic-picker"><span class="visually-hidden">${t("Epic", "需求")}</span><select data-change="epic" data-focus="epic-mobile" aria-label="${t("Epic", "需求")}">${epicOptions}</select></label>
         </div>
         <div class="epic-filters" id="epic-list-filters"${epicFiltersExpanded ? '' : ' hidden'}>
-          <label>${t("Status", "状态")}<select data-change="epic-status" data-focus="epic-status" aria-label="${t("Epic status", "史诗状态")}"><option value="">${t("All statuses", "全部状态")}</option>${statuses.map((status) => `<option value="${escapeHtml(status)}"${selected(epicStatus, status)}>${escapeHtml(statusLabel(status))}</option>`).join('')}</select></label>
-          <label>${t("Priority", "优先级")}<select data-change="epic-priority" data-focus="epic-priority" aria-label="${t("Epic priority", "史诗优先级")}"><option value="">${t("All priorities", "全部优先级")}</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(epicPriority, String(value))}>P${value}</option>`).join('')}</select></label>
-          <label>${t("Assignee", "负责人")}<select data-change="epic-assignee" data-focus="epic-assignee" aria-label="${t("Epic assignee", "史诗负责人")}"><option value="">${t("All assignees", "全部负责人")}</option><option value="unassigned"${selected(epicAssignee, 'unassigned')}>${t("Unassigned", "未指派")}</option>${assignees.map((name) => `<option value="${escapeHtml(`name:${name}`)}"${selected(epicAssignee, `name:${name}`)}>${escapeHtml(name)}</option>`).join('')}</select></label>
-          <p>${t("Only filters the epic list, not its tasks.", "只筛选史诗列表，不影响它下面的议题。")}</p>
+          <label>${t("Status", "状态")}<select data-change="epic-status" data-focus="epic-status" aria-label="${t("Epic status", "需求状态")}"><option value="">${t("All statuses", "全部状态")}</option>${statuses.map((status) => `<option value="${escapeHtml(status)}"${selected(epicStatus, status)}>${escapeHtml(statusLabel(status))}</option>`).join('')}</select></label>
+          <label>${t("Priority", "优先级")}<select data-change="epic-priority" data-focus="epic-priority" aria-label="${t("Epic priority", "需求优先级")}"><option value="">${t("All priorities", "全部优先级")}</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(epicPriority, String(value))}>P${value}</option>`).join('')}</select></label>
+          <label>${t("Assignee", "负责人")}<select data-change="epic-assignee" data-focus="epic-assignee" aria-label="${t("Epic assignee", "需求负责人")}"><option value="">${t("All assignees", "全部负责人")}</option><option value="unassigned"${selected(epicAssignee, 'unassigned')}>${t("Unassigned", "未指派")}</option>${assignees.map((name) => `<option value="${escapeHtml(`name:${name}`)}"${selected(epicAssignee, `name:${name}`)}>${escapeHtml(name)}</option>`).join('')}</select></label>
+          <p>${t("Only filters the epic list, not its tasks.", "只筛选需求列表，不影响它下面的议题。")}</p>
         </div>
-        <div class="rail__epic-meta"><span role="status">${snapshot ? t('{shown} of {total} epics', '{shown} / {total} 个史诗', { shown: matches.length, total: epics.length }) : t("Epics not loaded", "史诗还没加载")}</span><button class="btn btn--text btn--sm" type="button" data-action="clear-epic-filters" data-focus="clear-epic-filters" aria-label="${t("Reset epic list filters", "重置史诗列表筛选")}"${active || epicSearch ? '' : ' disabled'}>${t("Reset", "重置")}</button></div>
-        ${selectedOutside ? `<p class="rail__epic-notice">${t("Selected epic is outside these filters. Its tasks remain displayed.", "选中的史诗不在这些筛选里。它的议题仍会显示。")}</p>` : ''}
+        <div class="rail__epic-meta"><span role="status">${snapshot ? t('{shown} of {total} epics', '{shown} / {total} 个需求', { shown: matches.length, total: epics.length }) : t("Epics not loaded", "需求还没加载")}</span><button class="btn btn--text btn--sm" type="button" data-action="clear-epic-filters" data-focus="clear-epic-filters" aria-label="${t("Reset epic list filters", "重置需求列表筛选")}"${active || epicSearch ? '' : ' disabled'}>${t("Reset", "重置")}</button></div>
+        ${selectedOutside ? `<p class="rail__epic-notice">${t("Selected epic is outside these filters. Its tasks remain displayed.", "选中的需求不在这些筛选里。它的议题仍会显示。")}</p>` : ''}
         <div class="rail__epic-list">
-          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="all" aria-current="${pressed(epicValue === 'all')}">${icon('account_tree')}<span>${t("All epics", "全部史诗")}</span></button>
-          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="none" aria-current="${pressed(epicValue === 'none')}">${icon('account_tree')}<span>${t("No epic", "无史诗")}</span></button>
+          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="all" aria-current="${pressed(epicValue === 'all')}">${icon('account_tree')}<span>${t("All epics", "全部需求")}</span></button>
+          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="none" aria-current="${pressed(epicValue === 'none')}">${icon('account_tree')}<span>${t("No epic", "无需求")}</span></button>
           ${options.map((epic) => `<button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="id:${escapeHtml(epic.id)}" aria-current="${pressed(epicValue === `id:${epic.id}`)}" title="${escapeHtml(`${epic.title} · ${epic.id}`)}">${icon('account_tree')}<span>${escapeHtml(epic.title)} <small>${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? t(" · outside filters", " · 不在筛选里") : ''}</small></span></button>`).join('')}
         </div>
-        ${matches.length > shown.length ? `<p class="muted rail__epic-empty">${matches.length - shown.length}${t(" more; refine the search or filters.", " 条未显示，缩小搜索或筛选。")}</p>` : snapshot && !shown.length ? `<p class="muted rail__epic-empty">${t("No matching epics. Change the filters or reset them.", "没有对上的史诗。改筛选或重置。")}</p>` : ''}
+        ${matches.length > shown.length ? `<p class="muted rail__epic-empty">${matches.length - shown.length}${t(" more; refine the search or filters.", " 条未显示，缩小搜索或筛选。")}</p>` : snapshot && !shown.length ? `<p class="muted rail__epic-empty">${t("No matching epics. Change the filters or reset them.", "没有对上的需求。改筛选或重置。")}</p>` : ''}
       </section>
     </nav>`;
   }
@@ -614,7 +614,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const groups: Array<Group | 'all'> = ['all', 'ready', 'active', 'blocked'];
     if (!groups.includes(view)) groups.push(view);
     const effectiveLayout = view === 'all' ? layout : 'table';
-    const epicLabel = !epicFilter ? t("All epics", "全部史诗") : epicFilter.id === null ? t("No epic", "无史诗") : model?.byId.get(epicFilter.id)?.title || epicFilter.id;
+    const epicLabel = !epicFilter ? t("All epics", "全部需求") : epicFilter.id === null ? t("No epic", "无需求") : model?.byId.get(epicFilter.id)?.title || epicFilter.id;
     const scopeParts = [epicLabel, typeFilter, priorityFilter ? `P${priorityFilter}` : '', assigneeFilter, query.trim() ? t('search: “{q}”', '搜索：“{q}”', { q: query.trim() }) : ''].filter(Boolean);
     const visibleIds = new Set(filtered().map((issue) => issue.id));
     const hiddenSelection = [...taskPool.values()].filter((item) => item.project !== projectId || !visibleIds.has(item.id)).length;
@@ -998,7 +998,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
       const hostName = project ? portableHostName(project) : '';
       const id = value === 'none' ? null : value.startsWith('id:') ? value.slice(3) : '';
       if (!project || (id !== null && model?.byId.get(id)?.type !== 'epic')) {
-        actionError = t("Choose an epic in the selected project.", "在当前项目里选一个史诗。");
+        actionError = t("Choose an epic in the selected project.", "在当前项目里选一个需求。");
         render(); return;
       }
       epicFilter = { id, projectName: project.name, hostName };
