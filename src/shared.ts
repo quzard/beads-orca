@@ -54,6 +54,8 @@ export interface RpcRequest {
   method: string;
   project?: string;
   input?: Record<string, unknown>;
+  /** BCP-47 tag from the panel. Absent requests stay in English. */
+  locale?: string;
 }
 
 export interface Transport {

@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { bashCommand, executeSsh, handleRequest, ProjectUnavailableError, quoteRemote, RemoteCommandError, RemoteUnavailableError, type CommandOptions, type SshTarget } from '../core/service.js';
 import type { Project, ProjectAvailability, RpcRequest, Snapshot } from '../shared.js';
+import { t } from '../ui/i18n.js';
 
 export interface ProductHost {
   host: { call(method: string, params?: Record<string, unknown>): Promise<unknown> };
@@ -283,16 +284,16 @@ async function readOrcaHostList(): Promise<unknown> {
 
 function unsupportedHostReason(hostId: string, lookup: SshAliasLookup): string {
   if (!hostId.startsWith('ssh:')) {
-    return `Unsupported host ${hostId}. Paired runtime hosts need a remoteHosts SSH alias; there is no paired file adapter.`;
+    return t('Unsupported host {hostId}. Paired runtime hosts need a remoteHosts SSH alias; there is no paired file adapter.', '不支持的主机 {hostId}。配对的 runtime 主机需要在 remoteHosts 里写 SSH 别名；没有通用的配对文件通道。', { hostId });
   }
   if (lookup.error) {
-    return `Unsupported host ${hostId}. Could not read Orca SSH hosts (${lookup.error}). Set remoteHosts.destination to the ~/.ssh/config Host alias.`;
+    return t('Unsupported host {hostId}. Could not read Orca SSH hosts ({error}). Set remoteHosts.destination to the ~/.ssh/config Host alias.', '不支持的主机 {hostId}。读不到 Orca SSH 主机（{error}）。请把 remoteHosts.destination 设成 ~/.ssh/config 的 Host 别名。', { hostId, error: lookup.error });
   }
   const rejected = lookup.rejected.get(hostId);
   if (rejected) {
-    return `Unsupported host ${hostId}. Orca host name "${rejected}" is not a ~/.ssh/config alias. Set remoteHosts.destination to that alias.`;
+    return t('Unsupported host {hostId}. Orca host name "{name}" is not a ~/.ssh/config alias. Set remoteHosts.destination to that alias.', '不支持的主机 {hostId}。Orca 主机名「{name}」不是 ~/.ssh/config 别名。请把 remoteHosts.destination 设成那个别名。', { hostId, name: rejected });
   }
-  return `Unsupported host ${hostId}. It is not in \`orca host list\` as an SSH alias. Sync ~/.ssh/config, or set remoteHosts.destination.`;
+  return t('Unsupported host {hostId}. It is not in `orca host list` as an SSH alias. Sync ~/.ssh/config, or set remoteHosts.destination.', '不支持的主机 {hostId}。`orca host list` 里没有对应的 SSH 别名。请同步 ~/.ssh/config，或设置 remoteHosts.destination。', { hostId });
 }
 
 export function remoteHostsExample(hostId: string): string {

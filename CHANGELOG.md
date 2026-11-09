@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5-ssh.3-zh — 2026-11-09
+
+- The panel, settings labels, and the errors a person sees are Simplified Chinese when Orca's UI language is Chinese or unset.
+- Orca's UI language (`orca.locale`) selects the copy. English, and Traditional Chinese, keep the English strings. `hostId`, `bd`, `orca`, and JSON keys stay as they are.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.2 — 2026-11-09
 
 - SSH workspaces whose Orca host name is a `~/.ssh/config` Host alias connect without `remoteHosts`. The plugin reads `orca host list` and uses that name as `ssh` destination, with no `-F`, so OpenSSH reads the default config.

@@ -2,36 +2,36 @@
   "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
   "manifestVersion": 2,
   "id": "beads",
-  "name": "Beads Board",
-  "version": "0.2.5-ssh.2",
-  "description": "Beads board, handoff previews, documents and personal history for local workspaces and SSH hosts named as ~/.ssh/config aliases.",
+  "name": "Beads 看板",
+  "version": "0.2.5-ssh.3-zh",
+  "description": "Beads 看板、交接预览、文档和个人历史。支持本地工作区，以及主机名就是 ~/.ssh/config 别名的 SSH 工作区。",
   "author": { "name": "Roflochinsky" },
   "repository": "https://github.com/Roflochinsky/beads-orca",
   "license": "MIT",
   "cover": {
     "path": "docs/images/board.png",
-    "alt": "A sample Beads board with ready, in-progress, blocked and closed issues."
+    "alt": "示例 Beads 看板，包含就绪、进行中、阻塞和已关闭的议题。"
   },
   "screenshots": [
     {
       "path": "docs/images/board.png",
-      "alt": "Beads issues grouped into ready, in-progress, blocked and closed columns.",
-      "caption": "Board view"
+      "alt": "Beads 议题按就绪、进行中、阻塞和已关闭分列。",
+      "caption": "看板"
     },
     {
       "path": "docs/images/table.png",
-      "alt": "A table of Beads issues showing status, priority and relationships.",
-      "caption": "Table view"
+      "alt": "Beads 议题表格，显示状态、优先级和关系。",
+      "caption": "表格"
     },
     {
       "path": "docs/images/detail.png",
-      "alt": "A blocked issue's details, dependencies and comment form beside the board.",
-      "caption": "Issue details"
+      "alt": "看板旁边的阻塞议题详情、依赖和评论。",
+      "caption": "议题详情"
     },
     {
       "path": "docs/images/native-handoff-unreleased.png",
-      "alt": "A native Orca handoff preview selecting an OMP CLI session and a separate target worktree.",
-      "caption": "Unreleased handoff preview with synthetic tasks"
+      "alt": "原生 Orca 交接预览，选择 OMP CLI 会话和另一个目标 worktree。",
+      "caption": "未发布的交接预览，使用的是示例议题"
     }
   ],
   "engines": {
@@ -44,7 +44,7 @@
     "panels": [
       {
         "id": "beads",
-        "title": "Beads Board",
+        "title": "Beads 看板",
         "icon": "blocks",
         "entry": "integrations/orca/panel.html",
         "ui": "html"
@@ -53,44 +53,44 @@
     "settings": [
       {
         "key": "projectPaths",
-        "title": "Additional local Beads project paths",
-        "description": "One absolute directory per line. Orca workspaces are included automatically. SSH workspaces use the Orca host name as a ~/.ssh/config alias.",
+        "title": "附加的本地 Beads 项目路径",
+        "description": "每行一个绝对路径。Orca 工作区会自动加入。SSH 工作区把 Orca 主机名当作 ~/.ssh/config 的 Host 别名。",
         "type": "string",
         "multiline": true,
         "default": ""
       },
       {
         "key": "remoteHosts",
-        "title": "Remote Beads SSH connections",
-        "description": "Optional override of the automatic SSH alias. JSON mapping Orca host IDs to {destination, configFile?, name?}. destination replaces the host name from Orca; configFile is an optional absolute SSH config path; name is a portable display label. Leave empty when the Orca SSH host name is already the ~/.ssh/config Host alias. Never store credentials here.",
+        "title": "远程 Beads SSH 连接",
+        "description": "可选，用来覆盖自动识别的 SSH 别名。JSON 把 Orca hostId 映射为 {destination, configFile?, name?}。destination 替换 Orca 里的主机名；configFile 是桌面上可选的绝对 SSH 配置路径；name 是筛选器用的显示名。主机名已经是 ~/.ssh/config 的 Host 别名时留空。不要在这里存放凭据。",
         "type": "string",
         "multiline": true,
         "default": "{}"
       },
       {
         "key": "remotePath",
-        "title": "Remote PATH for bd and python3",
-        "description": "Colon-separated directories searched on the Linux host before the SSH default PATH. Tilde is expanded. Leave empty for ~/.local/bin, ~/bin, and /usr/local/bin. Commands run in bash --noprofile --norc, not the login shell.",
+        "title": "远端 bd 和 python3 的 PATH",
+        "description": "在 Linux 主机上、SSH 默认 PATH 之前搜索的目录，用冒号分隔。支持波浪号。留空则使用 ~/.local/bin、~/bin 和 /usr/local/bin。命令在 bash --noprofile --norc 里运行，不经过登录 shell。",
         "type": "string",
         "default": ""
       },
       {
         "key": "refreshSeconds",
-        "title": "Board refresh interval (seconds)",
-        "description": "How often a visible panel reloads. Leave empty for 15 seconds on local projects and 60 seconds when any remote host is configured. Allowed range is 5 to 300.",
+        "title": "看板刷新间隔（秒）",
+        "description": "可见面板多久重新加载一次。留空时本地项目 15 秒，配置了远程主机时 60 秒。允许 5 到 300。",
         "type": "string",
         "default": ""
       },
       {
         "key": "commandTimeoutSeconds",
-        "title": "bd and SSH command timeout (seconds)",
-        "description": "Budget for one Beads request, including every SSH call it makes. Leave empty for 30 seconds locally and 60 seconds over SSH. Allowed range is 5 to 110.",
+        "title": "bd 和 SSH 命令超时（秒）",
+        "description": "一次 Beads 请求的时间预算，包含其中每一次 SSH 调用。留空时本地 30 秒，SSH 60 秒。允许 5 到 110。",
         "type": "string",
         "default": ""
       }
     ],
     "statusBarItems": [
-      { "id": "queue", "text": "Beads —", "icon": "blocks", "tooltip": "Open the Beads panel to load a project." }
+      { "id": "queue", "text": "Beads —", "icon": "blocks", "tooltip": "打开 Beads 面板以加载项目。" }
     ]
   },
   "capabilities": [

@@ -4,6 +4,7 @@ import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, sep } from 'node:path';
 import { promisify } from 'node:util';
+import { t } from '../ui/i18n.js';
 import type { Issue, Project, RpcRequest, Snapshot } from '../shared.js';
 
 // bd 1.3.2: keep CLI policy authoritative (actor, claims, leases, readiness).
@@ -118,23 +119,23 @@ export function explainRemoteFailure(error: ExecFileException & { stderr?: strin
   const stderr = error.stderr?.trim() || '';
   const exit = error.code;
   if (/permission denied \(publickey\)|authentication failed|too many authentication failures/i.test(stderr)) {
-    return offlineFailure(`SSH authentication failed. Check the Mac SSH config, agent, and IdentityFile. ${stderr.slice(0, 500)}`, 'ssh-auth', error);
+    return offlineFailure(t('SSH authentication failed. Check the Mac SSH config, agent, and IdentityFile. {detail}', 'SSH 认证失败。检查 Mac 上的 SSH 配置、agent 和 IdentityFile。{detail}', { detail: stderr.slice(0, 500) }), 'ssh-auth', error);
   }
   if (exit === 255 || /connection timed out|connection refused|could not resolve|no route to host|network is unreachable|connection closed/i.test(stderr)) {
-    return offlineFailure(`SSH host is unreachable. ${stderr.slice(0, 500) || error.message}`, 'ssh-unreachable', error);
+    return offlineFailure(t('SSH host is unreachable. {detail}', 'SSH 主机不可达。{detail}', { detail: stderr.slice(0, 500) || error.message }), 'ssh-unreachable', error);
   }
   if (/bash: command not found|bash: not found/i.test(stderr)) {
-    return new RemoteCommandError('The remote host has no bash. Install bash; Beads Board does not run commands in the login shell.', 'ssh-bash-missing');
+    return new RemoteCommandError(t('The remote host has no bash. Install bash; Beads Board does not run commands in the login shell.', '远端没有 bash。请安装 bash；Beads 看板不在登录 shell 里执行命令。'), 'ssh-bash-missing');
   }
   if (exit === 127 || /command not found/i.test(stderr)) {
     if (context === 'python' || /python3/i.test(stderr)) {
-      return new RemoteCommandError('python3 was not found on the remote PATH. Install it or add its directory to the remotePath setting.', 'python-missing');
+      return new RemoteCommandError(t('python3 was not found on the remote PATH. Install it or add its directory to the remotePath setting.', '远端 PATH 上没有 python3。请安装，或把目录加到 remotePath。'), 'python-missing');
     }
-    return new RemoteCommandError('bd was not found on the remote PATH. Install bd 1.3.2 or add its directory to the remotePath setting, then run Test SSH connection.', 'bd-missing');
+    return new RemoteCommandError(t('bd was not found on the remote PATH. Install bd 1.3.2 or add its directory to the remotePath setting, then run Test SSH connection.', '远端 PATH 上没有 bd。请安装 bd 1.3.2，或把目录加到 remotePath，然后测试 SSH 连接。'), 'bd-missing');
   }
-  if (exit === 124) return offlineFailure('The workspace directory is not accessible on the remote host.', 'workspace-unavailable', error);
-  if (exit === 125) return new RemoteCommandError('This workspace has no .beads directory. Initialize it with bd on the remote host.', 'beads-missing');
-  if (exit === 126) return new RemoteCommandError('The .beads directory resolves outside the workspace. Refusing to follow that path.', 'beads-outside');
+  if (exit === 124) return offlineFailure(t('The workspace directory is not accessible on the remote host.', '远端访问不了这个工作区目录。'), 'workspace-unavailable', error);
+  if (exit === 125) return new RemoteCommandError(t('This workspace has no .beads directory. Initialize it with bd on the remote host.', '这个工作区没有 .beads 目录。请在远端用 bd 初始化。'), 'beads-missing');
+  if (exit === 126) return new RemoteCommandError(t('The .beads directory resolves outside the workspace. Refusing to follow that path.', '.beads 解析到了工作区外面。拒绝跟随这条路径。'), 'beads-outside');
   return error instanceof Error ? error : new Error(String(error));
 }
 
