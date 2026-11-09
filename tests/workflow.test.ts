@@ -313,20 +313,25 @@ test('history pages expose an explicit cursor instead of dropping older entries'
   assert.equal(new Set([...first.entries, ...second.entries].map((entry) => entry.id)).size, 3);
 });
 
-test('SSH worktree creation uses project and host, and agent launch does not invent --host', async () => {
+test('a bare ssh host refuses agent launch and worktree creation', async () => {
   const f = fixture('ssh:ssh-demo');
+  await assert.rejects(f.service.request({ method: 'worktree.preview', input: { project: 'source', name: 'Feature', branch: 'feature/ssh' } }), /ssh:/);
+  await assert.rejects(f.service.request({ method: 'handoff.preview', input: { groups: [f.group] } }), /ssh:/);
+  assert.equal(f.commands.some((argv) => argv.includes('--host')), false);
+});
+
+test('runtime handoff uses the server environment and a path selector', async () => {
+  const f = fixture('runtime:mini');
   const preview = await f.service.request({ method: 'worktree.preview', input: { project: 'source', name: 'Feature', branch: 'feature/ssh' } }) as WorktreePreview;
-  assert.ok(preview.argv.includes('--project'));
-  assert.ok(preview.argv.includes('--host'));
-  assert.equal(preview.argv[preview.argv.indexOf('--host') + 1], 'ssh:ssh-demo');
-  assert.equal(preview.argv.includes('--repo'), false);
+  assert.equal(preview.argv.includes('--host'), false);
+  assert.equal(preview.argv[preview.argv.indexOf('--environment') + 1], 'mini');
   const [handoff] = await f.service.request({ method: 'handoff.preview', input: { groups: [f.group] } }) as HandoffPreview[];
   assert.equal(handoff.errors.length, 0);
   await f.service.request({ method: 'handoff.send', input: { id: handoff.id } });
   const launch = f.commands.find((argv) => argv[0] === 'agent');
-  assert.ok(launch);
   assert.equal(launch?.includes('--host'), false);
-  assert.equal(launch?.[launch.indexOf('--worktree') + 1], 'id:repo::/demo');
+  assert.equal(launch?.[launch.indexOf('--environment') + 1], 'mini');
+  assert.equal(launch?.[launch.indexOf('--worktree') + 1], 'path:/demo');
 });
 
 test('explicitly mapped paired targets use the selected native environment, never the local runtime target', async () => {

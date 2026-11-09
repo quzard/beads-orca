@@ -104,9 +104,14 @@ export function remotePathExport(configured?: string): string {
   return `"${segments.join(':')}:$PATH"`;
 }
 
+/** bash --noprofile --norc 里执行的脚本。PATH 在脚本里展开 $HOME，不依赖调用方的环境。 */
+export function remoteShellScript(script: string, configuredPath?: string): string {
+  return `export PATH=${remotePathExport(configuredPath)}\n${script}`;
+}
+
 /** 登录 shell 只负责启动 bash。bashrc、zshenv 和 fish 函数进不了这条命令。 */
 export function bashCommand(script: string, configuredPath?: string): string {
-  const body = `export PATH=${remotePathExport(configuredPath)}\n${script}`;
+  const body = remoteShellScript(script, configuredPath);
   // env 直接执行 bash 二进制，登录 shell 里的 bash 函数或别名不会插进来。
   return `env -u BASH_ENV -u ENV bash --noprofile --norc -c ${quoteRemote(body)}`;
 }
@@ -290,22 +295,44 @@ function bdScript(projectPath: string, beadsDir: string, argv: string[]): string
   ].join('\n');
 }
 
-export type CommandOptions = { timeoutMs?: number; remotePath?: string };
+export type RemoteRun = (script: string, options: { stdin?: string; timeoutMs: number; maxBuffer: number; context: 'probe' | 'bd' | 'python' | 'exec' }) => Promise<{ stdout: string; stderr: string }>;
+export type CommandOptions = { timeoutMs?: number; remotePath?: string; remoteRun?: RemoteRun };
+
+/** fork.host.exec 的结果。截断和超时都不是成功的 bd JSON。 */
+export function finishForkCommand(result: { exitCode: number | null; signal: string | null; stdout: string; stderr: string; truncated: boolean; timedOut: boolean }, context: 'probe' | 'bd' | 'python' | 'exec'): { stdout: string; stderr: string } {
+  if (result.timedOut) {
+    throw Object.assign(new Error('remote command timed out'), { killed: true, code: 'ETIMEDOUT', stderr: result.stderr, stdout: result.stdout });
+  }
+  if (result.truncated) {
+    throw Object.assign(new Error('remote output truncated'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', stderr: result.stderr, stdout: result.stdout });
+  }
+  if (result.exitCode === 0) return { stdout: result.stdout, stderr: result.stderr };
+  if (result.exitCode === 127 && /bash/i.test(result.stderr) && /ENOENT|not found/i.test(result.stderr)) {
+    throw new RemoteCommandError(t('The remote host has no bash. Install bash; Beads Board does not run commands in the login shell.', '远端没有 bash。请安装 bash；Beads 看板不在登录 shell 里执行命令。'), 'ssh-bash-missing');
+  }
+  const error = Object.assign(new Error(result.stderr || result.stdout || 'remote command failed'), { code: result.exitCode ?? 'unknown', stderr: result.stderr, stdout: result.stdout });
+  const classified = explainRemoteFailure(error, context);
+  if (classified !== error) throw classified;
+  throw error;
+}
 
 async function runner(project: Project, target?: SshTarget, options: CommandOptions = {}): Promise<Run> {
   const remote = project.hostId != null && project.hostId !== 'local';
-  if (remote && !target) throw new Error(`Remote project ${project.id} requires an explicit SSH transport`);
-  if (!remote && target) throw new Error(`Local project ${project.id} cannot use a remote transport`);
+  if (remote && !target && !options.remoteRun) throw new Error(`Remote project ${project.id} requires an explicit SSH transport`);
+  if (!remote && (target || options.remoteRun)) throw new Error(`Local project ${project.id} cannot use a remote transport`);
   if (!isAbsolute(project.path) || project.path.includes('\0')) throw new Error(`Registered project ${project.id} must have an absolute path`);
   const timeoutMs = options.timeoutMs ?? (target ? REMOTE_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
   const deadline = Date.now() + timeoutMs;
   let remainingBytes = OUTPUT_LIMIT;
   let key: string;
   let beadsDir: string;
-  if (target) {
+  if (target || options.remoteRun) {
     let result: { stdout: string; stderr: string };
     try {
-      result = await executeSsh(target, bashCommand(beadsGuard(project.path, true), options.remotePath), { timeoutMs, maxBuffer: remainingBytes, context: 'probe' });
+      const probe = beadsGuard(project.path, true);
+      result = options.remoteRun
+        ? await options.remoteRun(probe, { timeoutMs, maxBuffer: remainingBytes, context: 'probe' })
+        : await executeSsh(target!, bashCommand(probe, options.remotePath), { timeoutMs, maxBuffer: remainingBytes, context: 'probe' });
     } catch (cause) {
       if (cause instanceof RemoteUnavailableError || cause instanceof RemoteCommandError) throw cause;
       throw explainRemoteFailure(cause as ExecFileException & { stderr?: string }, 'probe');
@@ -314,7 +341,7 @@ async function runner(project: Project, target?: SshTarget, options: CommandOpti
     const canonical = result.stdout.replace(/\n$/u, '');
     if (!isAbsolute(canonical)) throw new Error('SSH returned an invalid canonical .beads path');
     beadsDir = canonical;
-    key = `ssh:${target.configFile ?? ''}:${target.destination}:${canonical}`;
+    key = options.remoteRun ? `fork:${project.hostId}:${canonical}` : `ssh:${target?.configFile ?? ''}:${target?.destination ?? ''}:${canonical}`;
   } else {
     beadsDir = await canonicalBeadsDir(project.path);
     key = `local:${beadsDir}`;
@@ -335,9 +362,12 @@ async function runner(project: Project, target?: SshTarget, options: CommandOpti
     let output: string;
     try {
       let result: { stdout: string; stderr: string };
-      if (target) {
+      if (target || options.remoteRun) {
         // 登录 shell 只启动 bash。请求文本在单引号里，255 留给 SSH 自己。
-        result = await executeSsh(target, bashCommand(bdScript(project.path, beadsDir, argv), options.remotePath), { timeoutMs: remainingMs, maxBuffer: remainingBytes, context: 'bd' });
+        const script = bdScript(project.path, beadsDir, argv);
+        result = options.remoteRun
+          ? await options.remoteRun(script, { timeoutMs: remainingMs, maxBuffer: remainingBytes, context: 'bd' })
+          : await executeSsh(target!, bashCommand(script, options.remotePath), { timeoutMs: remainingMs, maxBuffer: remainingBytes, context: 'bd' });
       } else {
         const execution = executeFile('bd', argv, {
           cwd: project.path, env, encoding: 'utf8', shell: false,

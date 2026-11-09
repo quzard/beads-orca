@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.5-ssh.4 — 2026-11-09
+
+- When Orca exposes `fork.host.exec`, Beads on a paired `runtime:` server runs through that API (`argv`, no shell) instead of a second SSH login. `fork.workspaces.list` discovers those workspaces. `remoteHosts` still overrides the destination.
+- If `fork.*` is missing, or the paired server does not implement it yet, the plugin keeps the system SSH path, including the `~/.ssh/config` alias. A bare `ssh:` host is not used for agent launch.
+- Runtime handoff uses `orca agent launch --environment <envId>` and a `path:` worktree selector.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.3-zh — 2026-11-09
 
 - The panel, settings labels, and the errors a person sees are Simplified Chinese when Orca's UI language is Chinese or unset.

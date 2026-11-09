@@ -4,12 +4,13 @@ import { realpath } from 'node:fs/promises';
 import { basename, isAbsolute, posix } from 'node:path';
 import { promisify } from 'node:util';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { bashCommand, executeSsh, handleRequest, ProjectUnavailableError, quoteRemote, RemoteCommandError, RemoteUnavailableError, type CommandOptions, type SshTarget } from '../core/service.js';
+import { bashCommand, executeSsh, finishForkCommand, handleRequest, ProjectUnavailableError, quoteRemote, remoteShellScript, RemoteCommandError, RemoteUnavailableError, type CommandOptions, type RemoteRun, type SshTarget } from '../core/service.js';
 import type { Project, ProjectAvailability, RpcRequest, Snapshot } from '../shared.js';
 import { t } from '../ui/i18n.js';
+import { forkAvailable, forkExec, forkHosts, forkWorkspaces, ForkServerTooOld, type ForkCaller, type ForkHostRow, type ForkWorkspaceRow } from './fork-host.js';
 
 export interface ProductHost {
-  host: { call(method: string, params?: Record<string, unknown>): Promise<unknown> };
+  host: ForkCaller;
   settings: { get(key: string): Promise<unknown> };
 }
 
@@ -33,7 +34,8 @@ export interface ProjectIdentity {
 type Workspace = { id: string; name: string; path: string; hostId: string | null; branch?: string | null };
 type RemoteMapping = SshTarget & { name?: string };
 type AvailabilityState = { availability: ProjectAvailability; reason?: string; lastFetchedAt?: string; cacheError?: string };
-type Discovery = { projects: Project[]; targets: Map<string, SshTarget>; keys: Map<string, string> };
+type ForkBinding = { hostId: string; workspaceId: string; fallback?: SshTarget };
+type Discovery = { projects: Project[]; targets: Map<string, SshTarget>; forks: Map<string, ForkBinding>; keys: Map<string, string> };
 type Manifest = { version: 1; generation: string; chunks: number; hash: string; fetchedAt: string };
 
 const executeFile = promisify(execFile);
@@ -216,6 +218,15 @@ except (OSError, UnicodeError, ValueError) as exc:
     print(json.dumps({'ok': False, 'code': code, 'message': str(exc)}))
 `;
 
+// argv 单项最多 4096。程序本体放 stdin，这段引导留在 -c 里。
+const PYTHON_BOOTSTRAP = `import io,sys
+marker=b"\\n#__BEADS_REQ__\\n"
+raw=sys.stdin.buffer.read()
+src,req=raw.split(marker,1)
+sys.stdin=io.TextIOWrapper(io.BytesIO(req),encoding="utf-8")
+exec(compile(src.decode(),"beads-orca","exec"))
+`;
+
 type SshAliasLookup = {
   aliases: Map<string, string>;
   /** hostId → Orca 里看到的名字。该名字不是合法的 SSH config 别名。 */
@@ -313,6 +324,8 @@ function positiveSeconds(value: unknown, fallback: number, max: number): number 
 export class ProjectAccess {
   private readonly state = new Map<string, AvailabilityState>();
   private sshAliasCache: { at: number; lookup: SshAliasLookup } | null = null;
+  private forkCache: { at: number; hosts: ForkHostRow[]; workspaces: ForkWorkspaceRow[]; unreachable: string[] } | null = null;
+  private forkBlocked = new Set<string>();
   private readonly cacheQueues = new Map<string, Promise<void>>();
   private pathErrors: string[] = [];
   private remotePath = '';
@@ -343,6 +356,137 @@ export class ProjectAccess {
   }
 
   private async discover(): Promise<Discovery> {
+    const catalog = await this.forkCatalog();
+    if (catalog) return this.discoverFromFork(catalog);
+    return this.discoverConfigured();
+  }
+
+  private async forkCatalog(): Promise<{ hosts: ForkHostRow[]; workspaces: ForkWorkspaceRow[]; unreachable: string[] } | null> {
+    if (this.forkCache && Date.now() - this.forkCache.at < SSH_ALIAS_TTL_MS) return this.forkCache;
+    if (!(await forkAvailable(this.host.host))) return null;
+    try {
+      const [hosts, listed] = await Promise.all([forkHosts(this.host.host), forkWorkspaces(this.host.host)]);
+      if (listed.truncated) throw new Error('Orca truncated its workspace list. Narrow the registered workspaces before using Beads.');
+      const value = { at: Date.now(), hosts, workspaces: listed.workspaces, unreachable: listed.unreachable };
+      this.forkCache = value;
+      return value;
+    } catch (error) {
+      if (error instanceof Error && /truncated/i.test(error.message)) throw error;
+      return null;
+    }
+  }
+
+  private forkAlias(row: ForkHostRow | undefined): string | undefined {
+    const candidate = row?.configHost || row?.label;
+    return candidate && SSH_DESTINATION.test(candidate) ? candidate : undefined;
+  }
+
+  private forkRun(binding: ForkBinding): RemoteRun {
+    return async (script, options) => {
+      if (options.timeoutMs < 1_000) {
+        throw Object.assign(new Error('remote command timed out'), { killed: true, code: 'ETIMEDOUT', stderr: '', stdout: '' });
+      }
+      const body = remoteShellScript(script, this.remotePath);
+      const stdin = options.stdin === undefined ? body : `${body}\n${options.stdin}`;
+      const result = await forkExec(this.host.host, {
+        hostId: binding.hostId,
+        workspaceId: binding.workspaceId,
+        argv: ['bash', '--noprofile', '--norc', '-s'],
+        stdin,
+        timeoutMs: options.timeoutMs,
+        maxOutputBytes: options.maxBuffer,
+      });
+      return finishForkCommand(result, options.context);
+    };
+  }
+
+  private async discoverFromFork(catalog: { hosts: ForkHostRow[]; workspaces: ForkWorkspaceRow[]; unreachable: string[] }): Promise<Discovery> {
+    const mappings = remoteMappings(await this.host.settings.get('remoteHosts'));
+    const byHost = new Map(catalog.hosts.map((host) => [host.hostId, host]));
+    let context: { displayName?: string; branch?: string } | null = null;
+    try { context = await this.host.host.call('workspace.readContext') as { displayName?: string; branch?: string } | null; } catch { /* Focus is optional. */ }
+    const matches = context ? catalog.workspaces.filter((workspace) => workspace.name === context?.displayName && (workspace.branch ?? '') === (context?.branch ?? '')) : [];
+    const currentId = matches.length === 1 ? matches[0]?.id : undefined;
+    const targets = new Map<string, SshTarget>();
+    const forks = new Map<string, ForkBinding>();
+    const keys = new Map<string, string>();
+    const projects: Project[] = [];
+    for (const workspace of catalog.workspaces) {
+      if (!workspace || typeof workspace.id !== 'string' || typeof workspace.name !== 'string' || typeof workspace.path !== 'string' || typeof workspace.hostId !== 'string') {
+        throw new Error('Orca returned an invalid workspace');
+      }
+      const hostId = workspace.hostId;
+      const local = hostId === 'local';
+      const row = byHost.get(hostId);
+      const pluginId = local ? workspace.id : `${hostId}::${workspace.id}`;
+      const override = mappings.get(hostId);
+      const alias = this.forkAlias(row);
+      const ssh = override ?? (alias ? { destination: alias, name: row?.label || alias } : undefined);
+      const useFork = !local && !override && row?.exec === true && row.kind === 'runtime' && !this.forkBlocked.has(hostId);
+      const project: Project = {
+        id: pluginId, name: workspace.name, path: workspace.path, hostId,
+        ...(local ? { hostName: 'Local' } : { hostName: override?.name || row?.label || alias }),
+        workspaceId: workspace.id,
+        ...(currentId === undefined ? {} : { current: workspace.id === currentId && workspace.hostId === matches[0]?.hostId }),
+      };
+      const key = projectKey(project, useFork ? undefined : ssh);
+      keys.set(project.id, key);
+      if (useFork) forks.set(project.id, { hostId, workspaceId: workspace.id, ...(ssh ? { fallback: ssh } : {}) });
+      else if (ssh) targets.set(project.id, ssh);
+      const status = this.state.get(key);
+      if (!local && !useFork && !ssh) {
+        project.availability = 'unsupported';
+        project.availabilityReason = unsupportedHostReason(hostId, { aliases: new Map(), rejected: new Map() });
+      } else {
+        project.availability = status?.availability ?? 'unknown';
+        if (status?.reason) project.availabilityReason = status.reason;
+        if (status?.lastFetchedAt) project.lastFetchedAt = status.lastFetchedAt;
+        if (status?.cacheError) project.cacheError = status.cacheError;
+      }
+      projects.push(project);
+    }
+    await this.loadLimits();
+    this.pathErrors = catalog.unreachable.map((hostId) => t('{hostId}: Orca server is unreachable', '{hostId}：Orca 服务器不可达', { hostId }));
+    await this.appendProjectPaths(projects, keys, false);
+    return { projects, targets, forks, keys };
+  }
+
+  private async loadLimits(): Promise<void> {
+    const remotePath = await this.host.settings.get('remotePath');
+    this.remotePath = typeof remotePath === 'string' ? remotePath : '';
+    this.refreshSeconds = positiveSeconds(await this.host.settings.get('refreshSeconds'), 0, 300);
+    this.timeoutSeconds = positiveSeconds(await this.host.settings.get('commandTimeoutSeconds'), 0, 110);
+  }
+
+  private async appendProjectPaths(projects: Project[], keys: Map<string, string>, resetErrors: boolean): Promise<void> {
+    if (resetErrors) this.pathErrors = [];
+    const configured = await this.host.settings.get('projectPaths');
+    if (typeof configured !== 'string') return;
+    for (const line of configured.split('\n').map((value) => value.trim()).filter(Boolean)) {
+      if (!isAbsolute(line)) { this.pathErrors.push(`${line}: Beads project paths must be absolute`); continue; }
+      let path: string;
+      try { path = await realpath(line); }
+      catch (error) { this.pathErrors.push(`${line}: ${errorMessage(error)}`); continue; }
+      let matched = false;
+      for (const project of projects) {
+        if (project.hostId !== null && project.hostId !== 'local') continue;
+        const existing = await realpath(project.path).catch(() => project.path);
+        if (existing === path) { matched = true; break; }
+      }
+      if (matched) continue;
+      const project: Project = { id: `path:${path}`, name: basename(path), path, hostId: 'local', hostName: 'Local', workspaceId: null };
+      const key = projectKey(project);
+      keys.set(project.id, key);
+      const status = this.state.get(key);
+      project.availability = status?.availability ?? 'unknown';
+      if (status?.reason) project.availabilityReason = status.reason;
+      if (status?.lastFetchedAt) project.lastFetchedAt = status.lastFetchedAt;
+      if (status?.cacheError) project.cacheError = status.cacheError;
+      projects.push(project);
+    }
+  }
+
+  private async discoverConfigured(): Promise<Discovery> {
     const listed = await this.host.host.call('workspace.list') as { workspaces?: Workspace[]; truncated?: boolean };
     if (!listed || !Array.isArray(listed.workspaces)) throw new Error('Orca returned an invalid workspace list');
     if (listed.truncated) throw new Error('Orca truncated its workspace list. Narrow the registered workspaces before using Beads.');
@@ -387,50 +531,36 @@ export class ProjectAccess {
       }
       projects.push(project);
     }
-    const remotePath = await this.host.settings.get('remotePath');
-    this.remotePath = typeof remotePath === 'string' ? remotePath : '';
-    this.refreshSeconds = positiveSeconds(await this.host.settings.get('refreshSeconds'), 0, 300);
-    this.timeoutSeconds = positiveSeconds(await this.host.settings.get('commandTimeoutSeconds'), 0, 110);
-    const configured = await this.host.settings.get('projectPaths');
-    this.pathErrors = [];
-    if (typeof configured === 'string') {
-      for (const line of configured.split('\n').map((value) => value.trim()).filter(Boolean)) {
-        if (!isAbsolute(line)) { this.pathErrors.push(`${line}: Beads project paths must be absolute`); continue; }
-        let path: string;
-        try { path = await realpath(line); }
-        catch (error) { this.pathErrors.push(`${line}: ${errorMessage(error)}`); continue; }
-        let matched = false;
-        for (const project of projects) {
-          if (project.hostId !== null && project.hostId !== 'local') continue;
-          const existing = await realpath(project.path).catch(() => project.path);
-          if (existing === path) { matched = true; break; }
-        }
-        if (matched) continue;
-        const project: Project = { id: `path:${path}`, name: basename(path), path, hostId: 'local', hostName: 'Local', workspaceId: null };
-        const key = projectKey(project);
-        keys.set(project.id, key);
-        const status = this.state.get(key);
-        project.availability = status?.availability ?? 'unknown';
-        if (status?.reason) project.availabilityReason = status.reason;
-        if (status?.lastFetchedAt) project.lastFetchedAt = status.lastFetchedAt;
-        if (status?.cacheError) project.cacheError = status.cacheError;
-        projects.push(project);
-      }
-    }
-    return { projects, targets, keys };
+    await this.loadLimits();
+    await this.appendProjectPaths(projects, keys, true);
+    return { projects, targets, forks: new Map(), keys };
   }
 
   async list(): Promise<Project[]> {
     return (await this.discover()).projects;
   }
 
-  private async resolve(projectId: string): Promise<{ project: Project; target?: SshTarget; key: string }> {
-    const { projects, targets, keys } = await this.discover();
-    const project = projects.find((candidate) => candidate.id === projectId);
-    const key = project && keys.get(project.id);
+  private async resolve(projectId: string): Promise<{ project: Project; target?: SshTarget; fork?: ForkBinding; key: string; projects: Project[] }> {
+    const discovered = await this.discover();
+    const project = discovered.projects.find((candidate) => candidate.id === projectId);
+    const key = project && discovered.keys.get(project.id);
     if (!project || !key) throw new Error('A registered project ID is required');
     if (project.availability === 'unsupported') throw new Error(project.availabilityReason ?? 'Unsupported project host');
-    return { project, target: targets.get(project.id), key };
+    return { project, target: discovered.targets.get(project.id), fork: discovered.forks.get(project.id), key, projects: discovered.projects };
+  }
+
+  private async withTransport<T>(resolved: { target?: SshTarget; fork?: ForkBinding }, run: (transport: { target?: SshTarget; options: CommandOptions }) => Promise<T>): Promise<T> {
+    const fork = resolved.fork;
+    if (fork && !this.forkBlocked.has(fork.hostId)) {
+      try {
+        return await run({ options: this.commandOptions(true, this.forkRun(fork)) });
+      } catch (error) {
+        if (!(error instanceof ForkServerTooOld) || !fork.fallback) throw error;
+        this.forkBlocked.add(fork.hostId);
+        return await run({ target: fork.fallback, options: this.commandOptions(true) });
+      }
+    }
+    return await run({ target: resolved.target, options: this.commandOptions(Boolean(resolved.target)) });
   }
 
   async captureIdentity(projectId: string): Promise<ProjectIdentity> {
@@ -512,9 +642,9 @@ export class ProjectAccess {
     });
   }
 
-  private commandOptions(remote: boolean): CommandOptions {
+  private commandOptions(remote: boolean, remoteRun?: RemoteRun): CommandOptions {
     const timeoutMs = this.timeoutSeconds ? this.timeoutSeconds * 1000 : remote ? 60_000 : 30_000;
-    return { timeoutMs, ...(this.remotePath.trim() ? { remotePath: this.remotePath } : {}) };
+    return { timeoutMs, ...(this.remotePath.trim() ? { remotePath: this.remotePath } : {}), ...(remoteRun ? { remoteRun } : {}) };
   }
 
   private refreshMs(projects: Project[]): number {
@@ -541,7 +671,10 @@ export class ProjectAccess {
     assertIdentity(expected, project, key);
     if (project.availability === 'offline' && Object.hasOwn(MUTATIONS, request.method)) throw new Error(`Project ${project.name} is offline; refresh before writing`);
     try {
-      const response = await handleRequest(request, discovery.projects, discovery.targets.get(project.id), this.commandOptions(Boolean(discovery.targets.get(project.id))));
+      const response = await this.withTransport(
+        { target: discovery.targets.get(project.id), fork: discovery.forks.get(project.id) },
+        ({ target, options }) => handleRequest(request, discovery.projects, target, options),
+      );
       this.mark(key, 'online');
       if (request.method !== 'snapshot') return response;
       const snapshot = response as Snapshot;
@@ -579,23 +712,36 @@ export class ProjectAccess {
     if (action === 'write' && (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > FILE_LIMIT || Buffer.from(text, 'utf8').toString('utf8') !== text)) {
       throw new Error('Text must be a UTF-8 string of at most 2 MiB');
     }
-    const { project, target, key } = await this.resolve(projectId);
+    const resolved = await this.resolve(projectId);
+    const { project, key } = resolved;
     assertIdentity(expected, project, key);
     if ((action === 'write' || action === 'remove') && project.availability === 'offline') throw new Error(`Project ${project.name} is offline; refresh before writing`);
     const input = JSON.stringify({ root: project.path, path: normalized, action, ...(action === 'write' ? { text } : {}) });
     let stdout: string;
     try {
-      if (target) {
-        const script = `python3 -I -c ${quoteRemote(FILE_PROGRAM)}`;
-        ({ stdout } = await executeSsh(target, bashCommand(script, this.remotePath), { input, timeoutMs: this.commandOptions(true).timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'python' }));
-      } else {
+      stdout = await this.withTransport(resolved, async ({ target, options }) => {
+        if (options.remoteRun && resolved.fork) {
+          const result = await forkExec(this.host.host, {
+            hostId: resolved.fork.hostId,
+            workspaceId: resolved.fork.workspaceId,
+            argv: ['python3', '-I', '-c', PYTHON_BOOTSTRAP],
+            stdin: `${FILE_PROGRAM}\n#__BEADS_REQ__\n${input}`,
+            timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS,
+            maxOutputBytes: PROCESS_OUTPUT_LIMIT,
+          });
+          return finishForkCommand(result, 'python').stdout;
+        }
+        if (target) {
+          const script = `python3 -I -c ${quoteRemote(FILE_PROGRAM)}`;
+          return (await executeSsh(target, bashCommand(script, this.remotePath), { input, timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'python' })).stdout;
+        }
         const execution = executeFile('python3', ['-I', '-c', FILE_PROGRAM], {
           encoding: 'utf8', shell: false, timeout: PROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: PROCESS_OUTPUT_LIMIT, windowsHide: true,
         });
         execution.child.stdin?.on('error', () => undefined);
         execution.child.stdin?.end(input);
-        ({ stdout } = await execution);
-      }
+        return (await execution).stdout;
+      });
     } catch (cause) {
       if (cause instanceof RemoteUnavailableError) { this.mark(key, 'offline', cause.message); throw cause; }
       if (cause instanceof RemoteCommandError) throw cause;
@@ -639,18 +785,25 @@ export class ProjectAccess {
   /** Probe only an executable basename on the workspace's execution host. */
   async executableAvailable(projectId: string, command: string): Promise<boolean> {
     if (typeof command !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$/u.test(command)) throw new Error('Executable must be a command basename');
-    const { project, target, key } = await this.resolve(projectId);
+    const resolved = await this.resolve(projectId);
+    const { project, key } = resolved;
     try {
-      if (target) {
+      await this.withTransport(resolved, async ({ target, options }) => {
         const script = `cd -- ${quoteRemote(project.path)} || exit 125\ncommand -v ${quoteRemote(command)} >/dev/null 2>&1`;
-        await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: this.commandOptions(true).timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'exec' });
-      } else {
+        if (options.remoteRun) {
+          await options.remoteRun(script, { timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'exec' });
+          return;
+        }
+        if (target) {
+          await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'exec' });
+          return;
+        }
         const execution = executeFile('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'probe', command], {
           cwd: project.path, encoding: 'utf8', shell: false, timeout: PROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: PROCESS_OUTPUT_LIMIT,
         });
         execution.child.stdin?.end();
         await execution;
-      }
+      });
       this.mark(key, 'online');
       return true;
     } catch (error) {
@@ -663,8 +816,9 @@ export class ProjectAccess {
 
   /** 一条复用连接上的检查。登录 shell 不参与 bd/python 的查找。 */
   private async testSsh(projectId: string): Promise<{ ok: boolean; checks: SshCheck[] }> {
-    const { project, target, key } = await this.resolve(projectId);
-    if (!target) return { ok: false, checks: [{ name: 'mapping', ok: false, detail: 'This project is local, or its SSH host has no alias.' }] };
+    const resolved = await this.resolve(projectId);
+    const { project, key } = resolved;
+    if (!resolved.target && !resolved.fork) return { ok: false, checks: [{ name: 'mapping', ok: false, detail: t('This project is local, or its SSH host has no alias.', '这是本地项目，或这台 SSH 主机没有别名。') }] };
     const script = [
       'if ! command -v bash >/dev/null 2>&1; then echo bash=missing; exit 0; fi',
       'echo bash=ok',
@@ -682,14 +836,17 @@ export class ProjectAccess {
       'esac',
     ].join('\n');
     try {
-      const { stdout } = await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: this.commandOptions(true).timeoutMs ?? 60_000, maxBuffer: 1024 * 1024, context: 'exec' });
+      const { stdout } = await this.withTransport(resolved, async ({ target, options }) => {
+        if (options.remoteRun) return options.remoteRun(script, { timeoutMs: options.timeoutMs ?? 60_000, maxBuffer: 1024 * 1024, context: 'exec' });
+        return executeSsh(target!, bashCommand(script, this.remotePath), { timeoutMs: options.timeoutMs ?? 60_000, maxBuffer: 1024 * 1024, context: 'exec' });
+      });
       this.mark(key, 'online');
       const fields = Object.fromEntries(stdout.trim().split('\n').map((line) => {
         const index = line.indexOf('=');
         return [line.slice(0, index), line.slice(index + 1)];
       }));
       const checks: SshCheck[] = [
-        { name: 'connect', ok: true, detail: `Connected to ${target.destination}` },
+        { name: 'connect', ok: true, detail: resolved.fork ? t('Connected through Orca on {host}', '已通过 Orca 连到 {host}', { host: resolved.fork.hostId }) : `Connected to ${resolved.target?.destination}` },
         { name: 'bash', ok: fields.bash === 'ok', detail: fields.bash === 'ok' ? 'bash is available' : 'bash is missing' },
         { name: 'bd', ok: fields.bd !== 'missing' && Boolean(fields.bd), detail: fields.bd && fields.bd !== 'missing' ? fields.bd : 'bd was not found on the remote PATH' },
         { name: 'bd version', ok: Boolean(fields.version), detail: fields.version || 'bd did not print a version' },

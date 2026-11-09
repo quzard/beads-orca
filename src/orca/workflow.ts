@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Issue, Project, RpcRequest, Snapshot } from '../shared.js';
+import { t } from '../ui/i18n.js';
 import type { ProductHost, ProjectAccess } from './projects.js';
 import type { LibraryService } from './library.js';
 import { EXISTING_SESSION_REASON, NativeWorkflowCli, WorkflowCliError, launchDelivery, type WorkflowCli } from './workflow-cli.js';
@@ -39,17 +40,28 @@ function groupInput(value: unknown): HandoffGroup {
   if (recipient.kind !== 'new' && recipient.kind !== 'existing') throw new Error('Choose a recipient');
   return { tasks, target: text(input.target, 'target project'), mode: input.mode, documents, recipient: recipient.kind === 'new' ? { kind: 'new', agent: text(recipient.agent, 'agent') } : { kind: 'existing', terminal: text(recipient.terminal, 'terminal') } };
 }
+function runtimeEnvironment(host: string): string | null {
+  if (!host.startsWith('runtime:')) return null;
+  const encoded = host.slice('runtime:'.length);
+  if (!encoded) return null;
+  try { return decodeURIComponent(encoded); } catch { return encoded; }
+}
+function sshLaunchRefused(): Error {
+  return new Error(t('Orca does not launch agents on a bare ssh: host. Pair it as a runtime: server first.', 'Orca 不在裸的 ssh: 主机上启动代理。请先把它配成 runtime: 服务器。'));
+}
 function workspace(project: Project): string {
   if (!project.workspaceId) throw new Error('Target has no native Orca workspace identity');
-  if (hostOf(project).startsWith('runtime:')) return `path:${project.path}`;
+  if (runtimeEnvironment(hostOf(project))) return `path:${project.path}`;
+  if (hostOf(project).startsWith('ssh:')) throw sshLaunchRefused();
   return /^(identity:|folder:|id:|worktree:)/.test(project.workspaceId) ? project.workspaceId : `id:${project.workspaceId}`;
 }
 function available(project: Project) {
   if (project.availability === 'offline' || project.availability === 'unsupported') throw new Error(project.availabilityReason || `Project ${project.name} is ${project.availability}`);
 }
 function targetArgv(project: Project, argv: string[]): string[] {
-  const host = hostOf(project);
-  return host.startsWith('runtime:') ? [...argv, '--environment', host.slice('runtime:'.length)] : argv;
+  const environment = runtimeEnvironment(hostOf(project));
+  if (hostOf(project).startsWith('ssh:')) throw sshLaunchRefused();
+  return environment ? [...argv, '--environment', environment] : argv;
 }
 function matchesNativeHost(project: Project, nativeHost: unknown): boolean {
   const host = hostOf(project), actual = nativeHost ?? 'local';
@@ -282,21 +294,10 @@ export class WorkflowService {
     await this.save(entries);
     return entry;
   }
-  /** Orca 1.4.250 的 `agent launch` 不接受 `--host`。SSH 工作区只靠 worktree id，并且 show 的 hostId 必须一致。 */
+  /** runtime: 用 --environment 和 path:。裸 ssh: 不能启动代理。 */
   private async worktreeCreateArgv(project: Project, repoId: string, name: string, branch: string): Promise<string[]> {
-    const host = hostOf(project);
     const tail = ['--name', name, '--branch', branch, '--no-parent', '--setup', 'skip'];
-    if (!host.startsWith('ssh:')) return targetArgv(project, ['worktree', 'create', '--repo', `id:${repoId}`, ...tail]);
-    // `--host` 必须和 `--project` 一起用；单独加在 --repo 上会被 CLI 拒绝。
-    const listed = object(await this.cli.run(['project', 'setups', '--host', host]));
-    const setups = Array.isArray(listed.setups) ? listed.setups.map(object) : [];
-    const sameRepo = setups.filter((setup) => setup.repoId === repoId && (setup.hostId === undefined || setup.hostId === host));
-    const exact = sameRepo.filter((setup) => setup.path === project.path);
-    const chosen = exact[0] ?? (sameRepo.length === 1 ? sameRepo[0] : undefined);
-    if (!chosen || typeof chosen.projectId !== 'string') {
-      throw new Error(`Refusing to create a worktree for ${host} without a single Orca project setup. The same repo id can exist on the Mac and the Linux host; pass is not guessed.`);
-    }
-    return ['worktree', 'create', '--project', chosen.projectId, '--host', host, ...tail];
+    return targetArgv(project, ['worktree', 'create', '--repo', `id:${repoId}`, ...tail]);
   }
 
   private async worktreePreview(input: Record<string, unknown>): Promise<WorktreePreview> {
