@@ -224,7 +224,7 @@ test('oversized SSH output is an error, not an offline snapshot or a truncated s
   const root = await mkdtemp(join(tmpdir(), 'beads-remote-limit-'));
   const previousPath = process.env.PATH;
   try {
-    await writeFile(join(root, 'ssh'), `#!${process.execPath}\nconst cmd=process.argv.at(-1); if(cmd.includes('pwd -P')) process.stdout.write('/remote/.beads\\n'); else process.stdout.write('x'.repeat(16 * 1024 * 1024 + 1));\n`, { mode: 0o755 });
+    await writeFile(join(root, 'ssh'), `#!${process.execPath}\nconst cmd=process.argv.at(-1); if(!cmd.includes("'--json'")) process.stdout.write('/remote/.beads\\n'); else process.stdout.write('x'.repeat(16 * 1024 * 1024 + 1));\n`, { mode: 0o755 });
     process.env.PATH = `${root}${delimiter}${previousPath ?? ''}`;
     const service = new ProjectAccess(fixtureHost(
       [{ id: 'remote', name: 'Remote', path: '/remote', hostId: 'ssh:server' }],
@@ -275,6 +275,80 @@ test('remote native writes pin the remote store and treat issue text as data, no
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     if (previousDb === undefined) delete process.env.BD_DB; else process.env.BD_DB = previousDb;
     if (previousActor === undefined) delete process.env.BEADS_ACTOR; else process.env.BEADS_ACTOR = previousActor;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('one bad additional path does not hide the other projects', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-paths-'));
+  try {
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'local', name: 'Local', path: root, hostId: null }],
+      { projectPaths: `${join(root, 'missing')}\n${root}` },
+    ));
+    const projects = await service.list();
+    assert.equal(projects.some((project) => project.id === 'local'), true);
+    const diagnostics = await service.request({ method: 'diagnostics' }) as { pathErrors: string[] };
+    assert.equal(diagnostics.pathErrors.length, 1);
+    assert.match(diagnostics.pathErrors[0] ?? '', /missing/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('remote .beads symlinks and login-shell hijacks do not leave the workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-remote-link-'));
+  const previousPath = process.env.PATH;
+  const previousEnv = process.env.BASH_ENV;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const outside = join(root, 'outside');
+    const hijack = join(root, 'hijack.sh');
+    await mkdir(bin);
+    await mkdir(workspace);
+    await mkdir(join(outside, '.beads'), { recursive: true });
+    await symlink(join(outside, '.beads'), join(workspace, '.beads'));
+    await writeFile(hijack, 'bd() { echo HIJACKED; }\n');
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst cp=require('node:child_process'); const result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nprocess.stdout.write('HIJACKED');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    process.env.BASH_ENV = hijack;
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'remote', name: 'Remote', path: workspace, hostId: 'ssh:server' }],
+      { remoteHosts: JSON.stringify({ 'ssh:server': { destination: 'fixture' } }) },
+    ));
+    await assert.rejects(service.request({ method: 'snapshot', project: 'remote' }), /outside the workspace/i);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousEnv === undefined) delete process.env.BASH_ENV; else process.env.BASH_ENV = previousEnv;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('SSH connection test reports bd, python3, and the physical workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-ssh-test-'));
+  const previousPath = process.env.PATH;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    await mkdir(bin);
+    await mkdir(join(workspace, '.beads'), { recursive: true });
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst cp=require('node:child_process'); const result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nif (process.argv.includes('--version')) process.stdout.write('bd version 1.3.2\\n'); else process.stdout.write('');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'remote', name: 'Remote', path: workspace, hostId: 'ssh:server' }],
+      { remoteHosts: JSON.stringify({ 'ssh:server': { destination: 'fixture', name: 'Dev' } }) },
+    ));
+    const report = await service.request({ method: 'ssh.test', project: 'remote' }) as { ok: boolean; checks: { name: string; ok: boolean; detail: string }[] };
+    assert.equal(report.ok, true);
+    assert.equal(report.checks.find((check) => check.name === 'bd')?.ok, true);
+    assert.match(report.checks.find((check) => check.name === 'bd version')?.detail ?? '', /1\.3\.2/);
+    assert.equal(report.checks.find((check) => check.name === 'python3')?.ok, true);
+    assert.match(report.checks.find((check) => check.name === '.beads')?.detail ?? '', /ok /);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
 });

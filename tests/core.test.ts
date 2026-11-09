@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
-import { handleRequest } from '../src/core/service.js';
+import { bashCommand, canonicalBeadsDir, explainRemoteFailure, handleRequest, remotePathExport, RemoteCommandError } from '../src/core/service.js';
 import type { Project, Snapshot } from '../src/shared.js';
 
 // The agreed seam is handleRequest. Only the external bd executable is faked;
@@ -284,4 +284,31 @@ test('concurrent requests do not overlap embedded bd processes for one workspace
       handleRequest({ method: 'snapshot', project: project.id }, [project]) as Promise<Snapshot>));
     assert.ok(results.every((result) => result.issues.length === 0));
   });
+});
+
+test('remote commands start bash without rc files and keep a plain PATH', () => {
+  const command = bashCommand('bd --version', '~/bin:/opt/bd');
+  assert.match(command, /env -u BASH_ENV -u ENV bash --noprofile --norc -c /);
+  assert.match(command, /\$HOME\/bin:\/opt\/bd:\$PATH/);
+  assert.equal(remotePathExport(), `"${'$HOME/.local/bin:$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}:$PATH"`);
+  assert.throws(() => remotePathExport('$(touch /tmp/pwn)'), /command substitution/);
+  const missing = explainRemoteFailure({ code: 127, stderr: 'bash: command not found', message: 'fail' } as never, 'exec');
+  assert.ok(missing instanceof RemoteCommandError && missing.code === 'ssh-bash-missing');
+  const auth = explainRemoteFailure({ code: 255, stderr: 'Permission denied (publickey).', message: 'fail' } as never, 'exec');
+  assert.match(auth.message, /authentication failed/i);
+});
+
+test('a symlinked .beads directory outside the workspace is refused before bd runs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-link-'));
+  const outside = await mkdtemp(join(tmpdir(), 'beads-outside-'));
+  try {
+    const project = join(root, 'project');
+    await mkdir(project);
+    await mkdir(join(outside, '.beads'));
+    await symlink(join(outside, '.beads'), join(project, '.beads'));
+    await assert.rejects(canonicalBeadsDir(project), (error: unknown) => error instanceof RemoteCommandError && error.code === 'beads-outside');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });

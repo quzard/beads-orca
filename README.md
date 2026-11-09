@@ -10,12 +10,12 @@
 
 ## Install the stable release
 
-Current release: **v0.2.4**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review.
+Current release: **v0.2.5-ssh.1**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review.
 
 In Orca, open **Settings → Plugins → Add plugin → From Git URL** and enter:
 
 ```text
-https://github.com/Roflochinsky/beads-orca#v0.2.4
+https://github.com/quzard/beads-orca#v0.2.5-ssh.1
 ```
 
 Alternatively, use the [Orca community catalog](https://onorca.dev/plugins/roflochinsky.beads?catalog=community) once listed. Check the [listing status](https://www.onorca.dev/plugins/roflochinsky/beads-orca) if it is not available there; Git installation does not require a community listing.
@@ -24,7 +24,7 @@ Requirements:
 
 - Orca **1.4.250 or newer**.
 - Beads CLI **1.3.2** on the execution host and an initialized Beads project.
-- POSIX file semantics and `python3` for document/artifact operations; system SSH and explicit configuration for remote hosts.
+- POSIX file semantics, remote `bash`, and `python3` for document/artifact operations. System SSH on the Mac, with an explicit `remoteHosts` entry, for a Linux dev machine. `bd` must be on the remote PATH used by `bash --noprofile --norc` (the default search path includes `~/.local/bin` and `/usr/local/bin`).
 
 Review the publisher and access request during installation, approve only if you trust the plugin, and open the **Beads Board** panel in Orca. Local Orca workspaces are listed automatically. To add another local project, use **Additional local Beads project paths** in the plugin settings, one absolute project path per line.
 

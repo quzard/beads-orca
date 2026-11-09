@@ -89,6 +89,7 @@ export function createProductUI(context: Context) {
   let worktreeBase = '';
   let worktree: WorktreePreview | null = null;
   let worktreeResult = '';
+  let sshReport = '';
 
   function isUnavailable(projectId: string): boolean {
     const current = context.snapshot();
@@ -322,7 +323,13 @@ export function createProductUI(context: Context) {
       const entries = hosts.get(host) || []; entries.push(project); hosts.set(host, entries);
     }
     const current = context.projects().find((project) => project.current === true);
-    return `<p class="muted">Projects are read on their own host. Offline snapshots are read-only; unsupported hosts remain visible.</p>${current ? `<button type="button" class="btn btn--outlined btn--sm" data-product-action="host-project" data-id="${escape(current.id)}">View current workspace · ${escape(current.name)}</button>` : '<p class="muted">Current workspace could not be identified unambiguously.</p>'}${[...hosts].map(([host, projects]) => `<section class="product-section"><h3>${escape(host)}</h3><ul class="product-list">${projects.map((project) => `<li><div><strong>${escape(project.name)}</strong> ${project.current ? '<span class="muted">Current workspace</span>' : ''}<p class="muted">${escape(project.path)} · ${escape(context.projectAvailability(project))}${project.lastFetchedAt ? ` · last fetched ${escape(project.lastFetchedAt)}` : ''}${project.availabilityReason ? ` · ${escape(project.availabilityReason)}` : ''}${project.cacheError ? ` · Offline cache unavailable: ${escape(project.cacheError)}` : ''}</p></div><button type="button" class="btn btn--text btn--sm" data-product-action="host-project" data-id="${escape(project.id)}">View project</button></li>`).join('')}</ul></section>`).join('') || '<p class="muted">No projects available.</p>'}`;
+    const exampleFor = (hostId: string) => JSON.stringify({ [hostId]: { destination: 'linux-dev', configFile: '/Users/you/.ssh/config', name: 'Linux dev' } }, null, 2);
+    return `<p class="muted">Projects are read on their own host. Offline snapshots are read-only; unsupported hosts remain visible. Remote Beads uses a separate system SSH connection from this Mac, not Orca's session.</p>${current ? `<button type="button" class="btn btn--outlined btn--sm" data-product-action="host-project" data-id="${escape(current.id)}">View current workspace · ${escape(current.name)}</button>` : '<p class="muted">Current workspace could not be identified unambiguously.</p>'}${[...hosts].map(([host, projects]) => `<section class="product-section"><h3>${escape(host)}</h3><ul class="product-list">${projects.map((project) => {
+      const remote = project.hostId && project.hostId !== 'local';
+      const unmapped = project.availability === 'unsupported' && project.hostId;
+      const example = unmapped ? exampleFor(project.hostId!) : '';
+      return `<li><div><strong>${escape(project.name)}</strong> ${project.current ? '<span class="muted">Current workspace</span>' : ''}<p class="muted">${escape(project.path)} · ${escape(context.projectAvailability(project))}${project.hostId ? ` · host ${escape(project.hostId)}` : ''}${project.lastFetchedAt ? ` · last fetched ${escape(project.lastFetchedAt)}` : ''}${project.availabilityReason ? ` · ${escape(project.availabilityReason)}` : ''}${project.cacheError ? ` · Offline cache unavailable: ${escape(project.cacheError)}` : ''}</p>${unmapped ? `<label class="field">remoteHosts entry<textarea readonly rows="6">${escape(example)}</textarea></label><button type="button" class="btn btn--outlined btn--sm" data-product-action="copy-remote-hosts">Copy remoteHosts JSON</button>` : ''}${remote && !unmapped ? `<button type="button" class="btn btn--outlined btn--sm" data-product-action="ssh-test" data-id="${escape(project.id)}"${busy ? ' disabled' : ''}>Test SSH connection</button>` : ''}</div><button type="button" class="btn btn--text btn--sm" data-product-action="host-project" data-id="${escape(project.id)}">View project</button></li>`;
+    }).join('')}</ul></section>`).join('') || '<p class="muted">No projects available.</p>'}${sshReport ? `<pre class="command product-content" aria-label="SSH connection test">${escape(sshReport)}</pre>` : ''}`;
   }
 
   function dialog(): string {
@@ -542,6 +549,20 @@ export function createProductUI(context: Context) {
       await run(async () => { worktreeResult = 'Creation outcome unknown. Check Orca before trying again.'; const result = await workflow('worktree.create', { id: worktree!.id }); worktreeResult = result.outcome === 'created' ? 'Worktree created. Select it in Orca before assigning work.' : `Creation outcome unknown${result.error ? `: ${result.error}` : '.'} Check Orca before trying again.`; if (result.outcome === 'created') context.reloadProjects(); }); return true;
     }
     if (action === 'host-project') { context.selectProject(id); close(); return true; }
+    if (action === 'copy-remote-hosts') {
+      const snippet = target.closest('li')?.querySelector('textarea')?.value || '';
+      try { await navigator.clipboard.writeText(snippet); notice = 'Copied the remoteHosts entry.'; }
+      catch { notice = 'Clipboard is unavailable. Select the JSON below and copy it.'; }
+      context.render(); return true;
+    }
+    if (action === 'ssh-test') {
+      const project = id || context.projectId();
+      await run(async () => {
+        const result = await context.transport.request<{ ok: boolean; checks: { name: string; ok: boolean; detail: string }[] }>({ method: 'ssh.test', project });
+        sshReport = result.checks.map((check) => `${check.ok ? 'ok' : 'fail'}  ${check.name}: ${check.detail}`).join('\n');
+        notice = result.ok ? 'SSH checks passed.' : 'SSH checks failed. The details are below.';
+      }); return true;
+    }
     return true;
   }
 

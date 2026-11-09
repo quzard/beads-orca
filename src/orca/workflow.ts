@@ -282,6 +282,23 @@ export class WorkflowService {
     await this.save(entries);
     return entry;
   }
+  /** Orca 1.4.250 的 `agent launch` 不接受 `--host`。SSH 工作区只靠 worktree id，并且 show 的 hostId 必须一致。 */
+  private async worktreeCreateArgv(project: Project, repoId: string, name: string, branch: string): Promise<string[]> {
+    const host = hostOf(project);
+    const tail = ['--name', name, '--branch', branch, '--no-parent', '--setup', 'skip'];
+    if (!host.startsWith('ssh:')) return targetArgv(project, ['worktree', 'create', '--repo', `id:${repoId}`, ...tail]);
+    // `--host` 必须和 `--project` 一起用；单独加在 --repo 上会被 CLI 拒绝。
+    const listed = object(await this.cli.run(['project', 'setups', '--host', host]));
+    const setups = Array.isArray(listed.setups) ? listed.setups.map(object) : [];
+    const sameRepo = setups.filter((setup) => setup.repoId === repoId && (setup.hostId === undefined || setup.hostId === host));
+    const exact = sameRepo.filter((setup) => setup.path === project.path);
+    const chosen = exact[0] ?? (sameRepo.length === 1 ? sameRepo[0] : undefined);
+    if (!chosen || typeof chosen.projectId !== 'string') {
+      throw new Error(`Refusing to create a worktree for ${host} without a single Orca project setup. The same repo id can exist on the Mac and the Linux host; pass is not guessed.`);
+    }
+    return ['worktree', 'create', '--project', chosen.projectId, '--host', host, ...tail];
+  }
+
   private async worktreePreview(input: Record<string, unknown>): Promise<WorktreePreview> {
     const project = await this.project(text(input.project, 'source project'));
     available(project);
@@ -291,7 +308,7 @@ export class WorkflowService {
     const native = object(object(await this.cli.run(targetArgv(project, ['worktree', 'show', '--worktree', workspace(project)]))).worktree);
     if (typeof native.repoId !== 'string' || typeof native.id !== 'string') throw new Error('Native Git worktree identity is required');
     if (!matchesNativeHost(project, native.hostId) || native.path !== project.path) throw new Error('Native worktree host/path differs from selected source');
-    const argv = targetArgv(project, ['worktree', 'create', '--repo', `id:${native.repoId}`, '--name', name, '--branch', branch, '--no-parent', '--setup', 'skip']);
+    const argv = await this.worktreeCreateArgv(project, String(native.repoId), name, branch);
     if (base) argv.push('--base-branch', base);
     const preview: WorktreePreview = { id: randomUUID(), project, name, branch, ...(base ? { base } : {}), host: hostOf(project), argv, warnings: [
       'Explicit native worktree creation. No agent launch is requested, and no Beads database copy, commit, push, or automatic deletion is performed by the plugin.',

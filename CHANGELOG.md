@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.5-ssh.1 — 2026-11-09
+
+- Remote Beads commands now start with `env bash --noprofile --norc` and a configurable PATH, so a login shell (`fish`, `zsh`, or `.bashrc`) cannot alias or wrap `bd` and `python3`.
+- `.beads` must stay inside the workspace after `pwd -P`. A symlink to another database is refused locally and over SSH.
+- SSH worktree creation uses `orca worktree create --project <id> --host ssh:…`. `agent launch` does not gain `--host`, because Orca 1.4.250 and the current quzard/orca-fork reject that flag; launch still requires `worktree show` to report the same host and path.
+- SSH calls share a plugin-owned `ControlMaster` socket. The default refresh is 60 seconds when a remote host is configured, and the remote command budget is 60 seconds. Both are settings.
+- Authentication, reachability, missing bash, missing `bd`, missing `python3`, a missing `.beads`, and a `.beads` outside the workspace are separate errors.
+- One bad line in additional project paths is skipped and reported. The other workspaces still load.
+- Hosts in the panel can test an SSH mapping and copy a `remoteHosts` snippet for an unmapped host. The plugin id stays `beads`.
+
 ## 0.2.4 — 2026-11-07
 
 - Replaced text-only project/issue loading screens with layout-aware board and table skeletons in the existing warm monochrome palette.

@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "beads",
   "name": "Beads Board",
-  "version": "0.2.4",
+  "version": "0.2.5-ssh.1",
   "description": "Beads board, handoff previews, documents and personal history for local and explicitly mapped SSH workspaces.",
   "author": { "name": "Roflochinsky" },
   "repository": "https://github.com/Roflochinsky/beads-orca",
@@ -66,6 +66,27 @@
         "type": "string",
         "multiline": true,
         "default": "{}"
+      },
+      {
+        "key": "remotePath",
+        "title": "Remote PATH for bd and python3",
+        "description": "Colon-separated directories searched on the Linux host before the SSH default PATH. Tilde is expanded. Leave empty for ~/.local/bin, ~/bin, and /usr/local/bin. Commands run in bash --noprofile --norc, not the login shell.",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "refreshSeconds",
+        "title": "Board refresh interval (seconds)",
+        "description": "How often a visible panel reloads. Leave empty for 15 seconds on local projects and 60 seconds when any remote host is configured. Allowed range is 5 to 300.",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "commandTimeoutSeconds",
+        "title": "bd and SSH command timeout (seconds)",
+        "description": "Budget for one Beads request, including every SSH call it makes. Leave empty for 30 seconds locally and 60 seconds over SSH. Allowed range is 5 to 110.",
+        "type": "string",
+        "default": ""
       }
     ],
     "statusBarItems": [

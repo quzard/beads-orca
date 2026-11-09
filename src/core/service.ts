@@ -1,6 +1,8 @@
 import { execFile, type ExecFileException } from 'node:child_process';
-import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { lstat, mkdir, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { Issue, Project, RpcRequest, Snapshot } from '../shared.js';
 
@@ -8,6 +10,9 @@ import type { Issue, Project, RpcRequest, Snapshot } from '../shared.js';
 // A request has one 30s deadline and a 16 MiB aggregate stdout/stderr budget.
 // Exceeding either is an error, never a successful but truncated snapshot.
 const REQUEST_TIMEOUT_MS = 30_000;
+const REMOTE_TIMEOUT_MS = 60_000;
+// 面板 RPC 上限是 120s。远程预算必须留在这个上限下面。
+const MAX_COMMAND_TIMEOUT_MS = 110_000;
 const OUTPUT_LIMIT = 16 * 1024 * 1024;
 const TEXT_LIMIT = 64 * 1024;
 const DEPENDENCY_BATCH_SIZE = 100;
@@ -66,11 +71,85 @@ export function quoteRemote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+/** 非交互 bash 仍能找到用户安装的 bd，同时保留 sshd 给过来的系统 PATH。 */
+export const DEFAULT_REMOTE_PATH = '$HOME/.local/bin:$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
+export type RemoteFailureCode =
+  | 'ssh-auth' | 'ssh-unreachable' | 'ssh-bash-missing' | 'bd-missing' | 'python-missing'
+  | 'beads-missing' | 'beads-outside' | 'workspace-unavailable';
+
+/** 主机在线，但命令本身不能继续（缺 bash、缺 bd、库越界）。 */
+export class RemoteCommandError extends Error {
+  constructor(message: string, readonly code: RemoteFailureCode) {
+    super(message);
+    this.name = 'RemoteCommandError';
+  }
+}
+
+export function remotePathExport(configured?: string): string {
+  const source = configured?.trim() ? configured.trim() : DEFAULT_REMOTE_PATH;
+  if (/[\0\r\n`]/.test(source) || source.includes('$(') || source.includes('${')) {
+    throw new Error('remotePath must be a colon-separated directory list without command substitution');
+  }
+  const segments = source.split(':').filter((segment) => segment.length > 0).map((segment) => {
+    const expanded = segment === '~' ? '$HOME' : segment.startsWith('~/') ? `$HOME/${segment.slice(2)}` : segment;
+    const plain = expanded.replaceAll('$HOME', '');
+    if (plain.includes('$') || plain.includes('~') || plain.includes('"') || plain.includes("'") || plain.includes('\\') || plain.includes(' ')) {
+      throw new Error(`remotePath segment is not a plain directory: ${segment}`);
+    }
+    return expanded;
+  });
+  if (!segments.length) throw new Error('remotePath must contain at least one directory');
+  return `"${segments.join(':')}:$PATH"`;
+}
+
+/** 登录 shell 只负责启动 bash。bashrc、zshenv 和 fish 函数进不了这条命令。 */
+export function bashCommand(script: string, configuredPath?: string): string {
+  const body = `export PATH=${remotePathExport(configuredPath)}\n${script}`;
+  // env 直接执行 bash 二进制，登录 shell 里的 bash 函数或别名不会插进来。
+  return `env -u BASH_ENV -u ENV bash --noprofile --norc -c ${quoteRemote(body)}`;
+}
+
+function offlineFailure(message: string, code: RemoteFailureCode, cause?: unknown): RemoteUnavailableError {
+  return Object.assign(new RemoteUnavailableError(message, cause), { code });
+}
+
+export function explainRemoteFailure(error: ExecFileException & { stderr?: string }, context: 'probe' | 'bd' | 'python' | 'exec'): Error {
+  const stderr = error.stderr?.trim() || '';
+  const exit = error.code;
+  if (/permission denied \(publickey\)|authentication failed|too many authentication failures/i.test(stderr)) {
+    return offlineFailure(`SSH authentication failed. Check the Mac SSH config, agent, and IdentityFile. ${stderr.slice(0, 500)}`, 'ssh-auth', error);
+  }
+  if (exit === 255 || /connection timed out|connection refused|could not resolve|no route to host|network is unreachable|connection closed/i.test(stderr)) {
+    return offlineFailure(`SSH host is unreachable. ${stderr.slice(0, 500) || error.message}`, 'ssh-unreachable', error);
+  }
+  if (/bash: command not found|bash: not found/i.test(stderr)) {
+    return new RemoteCommandError('The remote host has no bash. Install bash; Beads Board does not run commands in the login shell.', 'ssh-bash-missing');
+  }
+  if (exit === 127 || /command not found/i.test(stderr)) {
+    if (context === 'python' || /python3/i.test(stderr)) {
+      return new RemoteCommandError('python3 was not found on the remote PATH. Install it or add its directory to the remotePath setting.', 'python-missing');
+    }
+    return new RemoteCommandError('bd was not found on the remote PATH. Install bd 1.3.2 or add its directory to the remotePath setting, then run Test SSH connection.', 'bd-missing');
+  }
+  if (exit === 124) return offlineFailure('The workspace directory is not accessible on the remote host.', 'workspace-unavailable', error);
+  if (exit === 125) return new RemoteCommandError('This workspace has no .beads directory. Initialize it with bd on the remote host.', 'beads-missing');
+  if (exit === 126) return new RemoteCommandError('The .beads directory resolves outside the workspace. Refusing to follow that path.', 'beads-outside');
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 /** All dynamic remote command arguments must be individually shell-quoted. */
+async function controlSocket(target: SshTarget): Promise<string> {
+  const dir = join(tmpdir(), 'beads-orca-ssh');
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const id = createHash('sha256').update(`${target.destination}\0${target.configFile ?? ''}`).digest('hex').slice(0, 12);
+  return join(dir, id);
+}
+
 export async function executeSsh(
   target: SshTarget,
   command: string,
-  options: { input?: string; timeoutMs: number; maxBuffer: number },
+  options: { input?: string; timeoutMs: number; maxBuffer: number; context?: 'probe' | 'bd' | 'python' | 'exec' },
 ): Promise<{ stdout: string; stderr: string }> {
   if (!/^[A-Za-z0-9_][A-Za-z0-9_.+@:-]*$/u.test(target.destination)) {
     throw new Error('SSH destination must be an explicit SSH host alias or user@host');
@@ -78,10 +157,13 @@ export async function executeSsh(
   if (target.configFile !== undefined && (!isAbsolute(target.configFile) || target.configFile.includes('\0'))) {
     throw new Error('SSH configFile must be an absolute path without NUL bytes');
   }
+  const socket = await controlSocket(target);
   const args = [
     ...(target.configFile ? ['-F', target.configFile] : []),
     '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
-    '-o', 'ClearAllForwardings=yes', '--', target.destination, command,
+    '-o', 'ClearAllForwardings=yes',
+    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', `ControlPath=${socket}`,
+    '--', target.destination, command,
   ];
   const execution = executeFile('ssh', args, {
     encoding: 'utf8', shell: false, timeout: options.timeoutMs,
@@ -95,12 +177,32 @@ export async function executeSsh(
   } catch (cause) {
     const error = cause as ExecFileException & { stderr?: string };
     if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw cause;
-    if (error.code === 255 || error.code === 'ENOENT' || error.killed) {
-      const detail = error.stderr?.trim() || error.message;
-      throw new RemoteUnavailableError(`SSH connection to ${target.destination} unavailable: ${detail.slice(0, 8192)}`, cause);
+    if (error.code === 'ENOENT') {
+      throw new RemoteUnavailableError('ssh was not found on the Mac PATH.', cause);
     }
-    throw cause;
+    if (error.killed) throw cause;
+    throw explainRemoteFailure(error, options.context ?? 'exec');
   }
+}
+
+/** 物理路径必须落在工作区里。符号链接指向别处时直接拒绝。 */
+export async function canonicalBeadsDir(projectPath: string): Promise<string> {
+  let root: string;
+  try { root = await realpath(projectPath); }
+  catch (cause) { throw new ProjectUnavailableError(`Workspace ${projectPath} is offline or inaccessible`, cause); }
+  const link = join(projectPath, '.beads');
+  let info;
+  try { info = await lstat(link); }
+  catch { throw new RemoteCommandError(`Registered project has no .beads directory at ${link}. Initialize that workspace with bd first.`, 'beads-missing'); }
+  if (!info.isDirectory() && !info.isSymbolicLink()) {
+    throw new RemoteCommandError(`${link} is not a Beads directory.`, 'beads-missing');
+  }
+  const beads = await realpath(link);
+  const expected = join(root, '.beads');
+  if (beads !== expected && !beads.startsWith(`${expected}${sep}`)) {
+    throw new RemoteCommandError(`The .beads directory resolves to ${beads}, outside workspace ${root}.`, 'beads-outside');
+  }
+  return beads;
 }
 
 function object(value: unknown, context: string): Row {
@@ -159,41 +261,62 @@ function inputFor(request: RpcRequest): Row {
   return input;
 }
 
-async function runner(project: Project, target?: SshTarget): Promise<Run> {
+function beadsGuard(projectPath: string, print: boolean): string {
+  return [
+    `cd -- ${quoteRemote(projectPath)} || exit 124`,
+    'beads_root=$(pwd -P) || exit 124',
+    'test -d .beads || exit 125',
+    'cd -P -- .beads || exit 125',
+    'beads_phys=$(pwd -P) || exit 125',
+    'case "$beads_phys" in',
+    '  "$beads_root"/.beads|"$beads_root"/.beads/*) ;;',
+    '  *) exit 126 ;;',
+    'esac',
+    ...(print ? ["printf '%s\\n' \"$beads_phys\""] : []),
+  ].join('\n');
+}
+
+function bdScript(projectPath: string, beadsDir: string, argv: string[]): string {
+  return [
+    beadsGuard(projectPath, false),
+    `cd -- ${quoteRemote(projectPath)} || exit 124`,
+    `unset ${ROUTING_ENV.join(' ')} || { echo "Could not clear ambient Beads routing" >&2; exit 125; }`,
+    `export BEADS_DIR=${quoteRemote(beadsDir)} BD_LAST_TOUCHED_FALLBACK=0 BD_ROUTING_MODE=explicit BD_ROUTING_DEFAULT=. BD_DIRECTORY_LABELS='{}' || exit 125`,
+    `bd ${argv.map(quoteRemote).join(' ')}`,
+    'beads_exit_status=$?',
+    'if [ "$beads_exit_status" -eq 255 ]; then exit 254; fi',
+    'exit "$beads_exit_status"',
+  ].join('\n');
+}
+
+export type CommandOptions = { timeoutMs?: number; remotePath?: string };
+
+async function runner(project: Project, target?: SshTarget, options: CommandOptions = {}): Promise<Run> {
   const remote = project.hostId != null && project.hostId !== 'local';
   if (remote && !target) throw new Error(`Remote project ${project.id} requires an explicit SSH transport`);
   if (!remote && target) throw new Error(`Local project ${project.id} cannot use a remote transport`);
   if (!isAbsolute(project.path) || project.path.includes('\0')) throw new Error(`Registered project ${project.id} must have an absolute path`);
-  const beadsDir = join(project.path, '.beads');
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? (target ? REMOTE_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
   let remainingBytes = OUTPUT_LIMIT;
   let key: string;
+  let beadsDir: string;
   if (target) {
-    const command = `cd -- ${quoteRemote(project.path)} || exit 124; test -d .beads && cd -P -- .beads && pwd -P`;
     let result: { stdout: string; stderr: string };
     try {
-      result = await executeSsh(target, command, { timeoutMs: REQUEST_TIMEOUT_MS, maxBuffer: remainingBytes });
+      result = await executeSsh(target, bashCommand(beadsGuard(project.path, true), options.remotePath), { timeoutMs, maxBuffer: remainingBytes, context: 'probe' });
     } catch (cause) {
-      if (cause instanceof RemoteUnavailableError) throw cause;
-      if ((cause as ExecFileException).code === 124) throw new ProjectUnavailableError(`Remote workspace ${project.id} is offline or inaccessible`, cause);
-      throw new Error(`Registered remote project ${project.id} has no accessible .beads directory; initialize that workspace with bd first`, { cause });
+      if (cause instanceof RemoteUnavailableError || cause instanceof RemoteCommandError) throw cause;
+      throw explainRemoteFailure(cause as ExecFileException & { stderr?: string }, 'probe');
     }
     remainingBytes -= Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr);
     const canonical = result.stdout.replace(/\n$/u, '');
     if (!isAbsolute(canonical)) throw new Error('SSH returned an invalid canonical .beads path');
+    beadsDir = canonical;
     key = `ssh:${target.configFile ?? ''}:${target.destination}:${canonical}`;
   } else {
-    try {
-      if (!(await stat(beadsDir)).isDirectory()) throw new Error('not a directory');
-    } catch (error) {
-      try {
-        if (!(await stat(project.path)).isDirectory()) throw new Error('not a directory');
-      } catch (cause) {
-        throw new ProjectUnavailableError(`Workspace ${project.id} is offline or inaccessible`, cause);
-      }
-      throw new Error(`Registered project ${project.id} has no accessible .beads directory; initialize that workspace with bd first`, { cause: error });
-    }
-    key = `local:${await realpath(beadsDir)}`;
+    beadsDir = await canonicalBeadsDir(project.path);
+    key = `local:${beadsDir}`;
   }
   const env: NodeJS.ProcessEnv = {
     ...process.env, BEADS_DIR: beadsDir, BD_LAST_TOUCHED_FALLBACK: '0',
@@ -205,24 +328,15 @@ async function runner(project: Project, target?: SshTarget): Promise<Run> {
   for (const name of ROUTING_ENV) delete env[name];
   const execute: Run = async (args, readonly, json = true) => {
     const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw new Error(`bd request timed out after ${REQUEST_TIMEOUT_MS}ms`);
+    if (remainingMs <= 0) throw new Error(`bd request timed out after ${timeoutMs}ms`);
     if (remainingBytes <= 0) throw new Error('bd output exceeded the 16 MiB request limit');
     const argv = ['--json', '--no-color', ...(readonly ? ['--readonly'] : []), ...args];
     let output: string;
     try {
       let result: { stdout: string; stderr: string };
       if (target) {
-        // SSH uses the remote login shell, so quote every argument and never
-        // interpolate request data as shell syntax. 255 is reserved by SSH.
-        const command = [
-          `cd -- ${quoteRemote(project.path)} || exit 125`,
-          'test -d .beads || { echo "workspace has no .beads directory" >&2; exit 125; }',
-          `unset ${ROUTING_ENV.join(' ')} || { echo "Could not clear ambient Beads routing" >&2; exit 125; }`,
-          `export BEADS_DIR=${quoteRemote(beadsDir)} BD_LAST_TOUCHED_FALLBACK=0 BD_ROUTING_MODE=explicit BD_ROUTING_DEFAULT=. BD_DIRECTORY_LABELS='{}' || exit 125`,
-          `bd ${argv.map(quoteRemote).join(' ')}`,
-          'beads_exit_status=$?; if [ "$beads_exit_status" -eq 255 ]; then exit 254; fi; exit "$beads_exit_status"',
-        ].join('; ');
-        result = await executeSsh(target, command, { timeoutMs: remainingMs, maxBuffer: remainingBytes });
+        // 登录 shell 只启动 bash。请求文本在单引号里，255 留给 SSH 自己。
+        result = await executeSsh(target, bashCommand(bdScript(project.path, beadsDir, argv), options.remotePath), { timeoutMs: remainingMs, maxBuffer: remainingBytes, context: 'bd' });
       } else {
         const execution = executeFile('bd', argv, {
           cwd: project.path, env, encoding: 'utf8', shell: false,
@@ -236,13 +350,15 @@ async function runner(project: Project, target?: SshTarget): Promise<Run> {
       remainingBytes -= Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr);
       output = result.stdout;
     } catch (cause) {
-      if (cause instanceof RemoteUnavailableError) throw cause;
+      if (cause instanceof RemoteUnavailableError || cause instanceof RemoteCommandError) throw cause;
       const error = cause as ExecFileException & { stdout?: string; stderr?: string };
       if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
         throw new Error('bd output exceeded the 16 MiB request limit; no partial result returned', { cause });
       }
       const detail = error.stderr?.trim() || error.stdout?.trim() || error.message;
-      const reason = error.killed ? `timed out after ${REQUEST_TIMEOUT_MS}ms` : `failed (${error.code ?? error.signal ?? 'unknown'})`;
+      const classified = explainRemoteFailure(error, 'bd');
+      if (classified !== error && (classified instanceof RemoteCommandError || classified instanceof RemoteUnavailableError)) throw classified;
+      const reason = error.killed ? `timed out after ${timeoutMs}ms` : `failed (${error.code ?? error.signal ?? 'unknown'})`;
       throw new Error(`bd ${args[0]} ${reason}: ${detail.slice(0, 8192)}`, { cause });
     }
     if (remainingBytes < 0) throw new Error('bd output exceeded the 16 MiB request limit; no partial result returned');
@@ -333,14 +449,14 @@ function flags(input: Row, fields: readonly string[]): string[] {
 }
 
 /** The sole host RPC entrypoint. project is a host-registered ID, never a path. */
-export async function handleRequest(request: RpcRequest, projects: Project[], target?: SshTarget): Promise<unknown> {
+export async function handleRequest(request: RpcRequest, projects: Project[], target?: SshTarget, options: CommandOptions = {}): Promise<unknown> {
   object(request, 'request');
   if (typeof request.method !== 'string') throw new Error('request.method must be a string');
   const input = inputFor(request);
   if (request.method === 'projects') return projects.map((project) => ({ ...project }));
   const project = projects.find((candidate) => candidate.id === request.project);
   if (!project) throw new Error('A registered project ID is required');
-  const run = await runner(project, target);
+  const run = await runner(project, target, options);
   // Reject IDs absent from the local list; no shorthand is accepted here.
   // This is a precheck, not atomic isolation: bd 1.3.2 may prefix-route if an
   // external actor deletes the local ID before the next native command.

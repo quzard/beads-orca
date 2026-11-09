@@ -152,6 +152,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
   let commentsSequence = 0;
   let undoClose: { project: string; id: string; updatedAt: string; closedAt?: string } | null = null;
   let projectLoadTask: Promise<void> | null = null;
+  let pathErrors: string[] = [];
+  let refreshMs = 15_000;
   let snapshotGeneration = 0;
   let detailOrigin: HTMLElement | null = null;
   let projectsReloadPending = false;
@@ -261,7 +263,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const error = actionError && !createOpen ? `<div class="banner" role="alert">${icon('error')}<div><strong>Could not complete the action</strong><p>${escapeHtml(actionError)}</p></div><button class="btn btn--icon" data-action="dismiss-error" type="button" aria-label="Dismiss error">${icon('close')}</button></div>` : '';
     const undo = undoClose && undoClose.project === projectId ? `<div class="banner banner--undo" role="status"><div><strong>Closed ${escapeHtml(undoClose.id)}</strong><p>Undo reopens this issue if it has not changed.</p></div><button class="btn btn--outlined btn--sm" type="button" data-action="undo-close" title="${escapeHtml(actionCommand('reopen', undoClose.id))}"${disabled()}>Undo</button><button class="btn btn--icon" type="button" data-action="dismiss-undo" aria-label="Dismiss close message">${icon('close')}</button></div>` : '';
     const cacheNotice = snapshot?.project.cacheError && !offline() ? `<div class="banner" role="status"><div><strong>Offline cache unavailable</strong><p>${escapeHtml(snapshot.project.cacheError)} The current snapshot is live but may not be available offline.</p></div></div>` : '';
-    return stale + cacheNotice + error + undo;
+    const paths = pathErrors.length ? `<div class="banner" role="status"><div><strong>Some additional project paths were skipped</strong><pre class="command">${escapeHtml(pathErrors.join('\n'))}</pre></div></div>` : '';
+    return stale + cacheNotice + paths + error + undo;
   }
 
   function createButton(): string {
@@ -761,6 +764,14 @@ export function mount(root: HTMLElement, transport: Transport): void {
         const result = await transport.request<Project[]>({ method: 'projects' });
         if (disposed) return;
         projects = result;
+        try {
+          const diagnostics = await transport.request<{ pathErrors?: string[]; refreshMs?: number }>({ method: 'diagnostics' });
+          pathErrors = Array.isArray(diagnostics.pathErrors) ? diagnostics.pathErrors : [];
+          if (typeof diagnostics.refreshMs === 'number' && diagnostics.refreshMs >= 5_000 && diagnostics.refreshMs !== refreshMs) {
+            refreshMs = diagnostics.refreshMs;
+            armRefresh();
+          }
+        } catch { pathErrors = []; }
         if (!projects.some((project) => project.id === projectId)) {
           const current = projects.filter((project) => project.current);
           projectId = (!projectId && current.length === 1 ? current[0]?.id : undefined) || projects[0]?.id || '';
@@ -1445,10 +1456,15 @@ export function mount(root: HTMLElement, transport: Transport): void {
   document.addEventListener('visibilitychange', onVisibility);
   document.addEventListener('pointerdown', onDocumentPointerDown);
   window.addEventListener('resize', onResize);
-  const timer = window.setInterval(() => {
-    if (!root.isConnected) { cleanup(); return; }
-    if (!document.hidden && projectId && !pending && !drag && !refreshTask) void refresh();
-  }, 15_000);
+  let timer = 0;
+  function armRefresh(): void {
+    window.clearInterval(timer);
+    timer = window.setInterval(() => {
+      if (!root.isConnected) { cleanup(); return; }
+      if (!document.hidden && projectId && !pending && !drag && !refreshTask) void refresh();
+    }, refreshMs);
+  }
+  armRefresh();
   function cleanup(): void {
     disposed = true;
     window.clearInterval(timer);

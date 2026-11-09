@@ -4,7 +4,7 @@ import { realpath } from 'node:fs/promises';
 import { basename, isAbsolute, posix } from 'node:path';
 import { promisify } from 'node:util';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { executeSsh, handleRequest, ProjectUnavailableError, quoteRemote, RemoteUnavailableError, type SshTarget } from '../core/service.js';
+import { bashCommand, executeSsh, handleRequest, ProjectUnavailableError, quoteRemote, RemoteCommandError, RemoteUnavailableError, type CommandOptions, type SshTarget } from '../core/service.js';
 import type { Project, ProjectAvailability, RpcRequest, Snapshot } from '../shared.js';
 
 export interface ProductHost {
@@ -36,6 +36,8 @@ type Discovery = { projects: Project[]; targets: Map<string, SshTarget>; keys: M
 type Manifest = { version: 1; generation: string; chunks: number; hash: string; fetchedAt: string };
 
 const executeFile = promisify(execFile);
+const LOCAL_REFRESH_MS = 15_000;
+const REMOTE_REFRESH_MS = 60_000;
 const FILE_LIMIT = 2 * 1024 * 1024;
 const PROCESS_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 30_000;
@@ -208,9 +210,27 @@ except (OSError, UnicodeError, ValueError) as exc:
     print(json.dumps({'ok': False, 'code': code, 'message': str(exc)}))
 `;
 
+export function remoteHostsExample(hostId: string): string {
+  return JSON.stringify({ [hostId]: { destination: 'linux-dev', configFile: '/Users/you/.ssh/config', name: 'Linux dev' } }, null, 2);
+}
+
+export type SshCheck = { name: string; ok: boolean; detail: string };
+export type Diagnostics = { pathErrors: string[]; refreshMs: number; unmapped: { hostId: string; example: string }[] };
+
+function positiveSeconds(value: unknown, fallback: number, max: number): number {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 5 || seconds > max) return fallback;
+  return seconds;
+}
+
 export class ProjectAccess {
   private readonly state = new Map<string, AvailabilityState>();
   private readonly cacheQueues = new Map<string, Promise<void>>();
+  private pathErrors: string[] = [];
+  private remotePath = '';
+  private refreshSeconds = 0;
+  private timeoutSeconds = 0;
 
   constructor(private readonly host: ProductHost) {}
 
@@ -244,7 +264,7 @@ export class ProjectAccess {
       const status = this.state.get(key);
       if (!local && !target) {
         project.availability = 'unsupported';
-        project.availabilityReason = `Unsupported host ${hostId}: configure an explicit SSH mapping in remoteHosts`;
+        project.availabilityReason = `Unsupported host ${hostId}. Open Hosts and copy the remoteHosts entry; destination is a Mac SSH alias, not an Orca connection.`;
       } else {
         project.availability = status?.availability ?? 'unknown';
         if (status?.reason) project.availabilityReason = status.reason;
@@ -253,11 +273,18 @@ export class ProjectAccess {
       }
       projects.push(project);
     }
+    const remotePath = await this.host.settings.get('remotePath');
+    this.remotePath = typeof remotePath === 'string' ? remotePath : '';
+    this.refreshSeconds = positiveSeconds(await this.host.settings.get('refreshSeconds'), 0, 300);
+    this.timeoutSeconds = positiveSeconds(await this.host.settings.get('commandTimeoutSeconds'), 0, 110);
     const configured = await this.host.settings.get('projectPaths');
+    this.pathErrors = [];
     if (typeof configured === 'string') {
       for (const line of configured.split('\n').map((value) => value.trim()).filter(Boolean)) {
-        if (!isAbsolute(line)) throw new Error('Beads project paths must be absolute');
-        const path = await realpath(line);
+        if (!isAbsolute(line)) { this.pathErrors.push(`${line}: Beads project paths must be absolute`); continue; }
+        let path: string;
+        try { path = await realpath(line); }
+        catch (error) { this.pathErrors.push(`${line}: ${errorMessage(error)}`); continue; }
         let matched = false;
         for (const project of projects) {
           if (project.hostId !== null && project.hostId !== 'local') continue;
@@ -371,7 +398,26 @@ export class ProjectAccess {
     });
   }
 
+  private commandOptions(remote: boolean): CommandOptions {
+    const timeoutMs = this.timeoutSeconds ? this.timeoutSeconds * 1000 : remote ? 60_000 : 30_000;
+    return { timeoutMs, ...(this.remotePath.trim() ? { remotePath: this.remotePath } : {}) };
+  }
+
+  private refreshMs(projects: Project[]): number {
+    if (this.refreshSeconds) return this.refreshSeconds * 1000;
+    return projects.some((project) => project.hostId && project.hostId !== 'local') ? REMOTE_REFRESH_MS : LOCAL_REFRESH_MS;
+  }
+
+  private diagnostics(projects: Project[]): Diagnostics {
+    const unmapped = projects.filter((project) => project.availability === 'unsupported' && project.hostId).map((project) => ({
+      hostId: project.hostId!, example: remoteHostsExample(project.hostId!),
+    }));
+    return { pathErrors: [...this.pathErrors], refreshMs: this.refreshMs(projects), unmapped };
+  }
+
   async request(request: RpcRequest, expected?: ProjectIdentity): Promise<unknown> {
+    if (request?.method === 'diagnostics') return this.diagnostics(await this.list());
+    if (request?.method === 'ssh.test') return this.testSsh(typeof request.project === 'string' ? request.project : '');
     const discovery = await this.discover();
     if (request?.method === 'projects') return handleRequest(request, discovery.projects);
     const project = discovery.projects.find((candidate) => candidate.id === request?.project);
@@ -381,7 +427,7 @@ export class ProjectAccess {
     assertIdentity(expected, project, key);
     if (project.availability === 'offline' && Object.hasOwn(MUTATIONS, request.method)) throw new Error(`Project ${project.name} is offline; refresh before writing`);
     try {
-      const response = await handleRequest(request, discovery.projects, discovery.targets.get(project.id));
+      const response = await handleRequest(request, discovery.projects, discovery.targets.get(project.id), this.commandOptions(Boolean(discovery.targets.get(project.id))));
       this.mark(key, 'online');
       if (request.method !== 'snapshot') return response;
       const snapshot = response as Snapshot;
@@ -426,8 +472,8 @@ export class ProjectAccess {
     let stdout: string;
     try {
       if (target) {
-        const command = ['python3', '-I', '-c', FILE_PROGRAM].map(quoteRemote).join(' ');
-        ({ stdout } = await executeSsh(target, command, { input, timeoutMs: PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT }));
+        const script = `python3 -I -c ${quoteRemote(FILE_PROGRAM)}`;
+        ({ stdout } = await executeSsh(target, bashCommand(script, this.remotePath), { input, timeoutMs: this.commandOptions(true).timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'python' }));
       } else {
         const execution = executeFile('python3', ['-I', '-c', FILE_PROGRAM], {
           encoding: 'utf8', shell: false, timeout: PROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: PROCESS_OUTPUT_LIMIT, windowsHide: true,
@@ -438,6 +484,7 @@ export class ProjectAccess {
       }
     } catch (cause) {
       if (cause instanceof RemoteUnavailableError) { this.mark(key, 'offline', cause.message); throw cause; }
+      if (cause instanceof RemoteCommandError) throw cause;
       throw new Error(`Workspace file access failed; python3 is required on the workspace host: ${errorMessage(cause)}`, { cause });
     }
     this.mark(key, 'online');
@@ -481,8 +528,8 @@ export class ProjectAccess {
     const { project, target, key } = await this.resolve(projectId);
     try {
       if (target) {
-        const script = `cd -- ${quoteRemote(project.path)} || exit 125; command -v ${quoteRemote(command)} >/dev/null 2>&1`;
-        await executeSsh(target, script, { timeoutMs: PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT });
+        const script = `cd -- ${quoteRemote(project.path)} || exit 125\ncommand -v ${quoteRemote(command)} >/dev/null 2>&1`;
+        await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: this.commandOptions(true).timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: PROCESS_OUTPUT_LIMIT, context: 'exec' });
       } else {
         const execution = executeFile('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'probe', command], {
           cwd: project.path, encoding: 'utf8', shell: false, timeout: PROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: PROCESS_OUTPUT_LIMIT,
@@ -494,8 +541,53 @@ export class ProjectAccess {
       return true;
     } catch (error) {
       if (error instanceof RemoteUnavailableError) { this.mark(key, 'offline', error.message); throw error; }
+      if (error instanceof RemoteCommandError) throw error;
       if ((error as ExecFileException).code === 1) { this.mark(key, 'online'); return false; }
       throw error;
+    }
+  }
+
+  /** 一条复用连接上的检查。登录 shell 不参与 bd/python 的查找。 */
+  private async testSsh(projectId: string): Promise<{ ok: boolean; checks: SshCheck[] }> {
+    const { project, target, key } = await this.resolve(projectId);
+    if (!target) return { ok: false, checks: [{ name: 'mapping', ok: false, detail: 'This project is local, or its host has no remoteHosts entry.' }] };
+    const script = [
+      'if ! command -v bash >/dev/null 2>&1; then echo bash=missing; exit 0; fi',
+      'echo bash=ok',
+      'if command -v bd >/dev/null 2>&1; then echo "bd=$(command -v bd)"; echo "version=$(bd --version 2>/dev/null | head -n 1)"; else echo bd=missing; echo version=; fi',
+      'if command -v python3 >/dev/null 2>&1; then echo "python=$(command -v python3)"; else echo python=missing; fi',
+      `cd -- ${quoteRemote(project.path)} || { echo root=inaccessible; echo beads=unchecked; exit 0; }`,
+      'echo "root=$(pwd -P)"',
+      'if [ ! -d .beads ]; then echo beads=missing; exit 0; fi',
+      'beads_root=$(pwd -P)',
+      'cd -P -- .beads || { echo beads=unreadable; exit 0; }',
+      'beads_phys=$(pwd -P)',
+      'case "$beads_phys" in',
+      '  "$beads_root"/.beads|"$beads_root"/.beads/*) echo "beads=ok $beads_phys" ;;',
+      '  *) echo "beads=outside $beads_phys" ;;',
+      'esac',
+    ].join('\n');
+    try {
+      const { stdout } = await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: this.commandOptions(true).timeoutMs ?? 60_000, maxBuffer: 1024 * 1024, context: 'exec' });
+      this.mark(key, 'online');
+      const fields = Object.fromEntries(stdout.trim().split('\n').map((line) => {
+        const index = line.indexOf('=');
+        return [line.slice(0, index), line.slice(index + 1)];
+      }));
+      const checks: SshCheck[] = [
+        { name: 'connect', ok: true, detail: `Connected to ${target.destination}` },
+        { name: 'bash', ok: fields.bash === 'ok', detail: fields.bash === 'ok' ? 'bash is available' : 'bash is missing' },
+        { name: 'bd', ok: fields.bd !== 'missing' && Boolean(fields.bd), detail: fields.bd && fields.bd !== 'missing' ? fields.bd : 'bd was not found on the remote PATH' },
+        { name: 'bd version', ok: Boolean(fields.version), detail: fields.version || 'bd did not print a version' },
+        { name: 'python3', ok: fields.python !== 'missing' && Boolean(fields.python), detail: fields.python && fields.python !== 'missing' ? fields.python : 'python3 was not found on the remote PATH' },
+        { name: 'workspace', ok: Boolean(fields.root) && fields.root !== 'inaccessible', detail: fields.root || 'workspace path is not accessible' },
+        { name: '.beads', ok: Boolean(fields.beads?.startsWith('ok ')), detail: fields.beads || 'not checked' },
+      ];
+      return { ok: checks.every((check) => check.ok), checks };
+    } catch (error) {
+      const message = errorMessage(error);
+      if (error instanceof RemoteUnavailableError) this.mark(key, 'offline', message);
+      return { ok: false, checks: [{ name: 'connect', ok: false, detail: message }] };
     }
   }
 }
