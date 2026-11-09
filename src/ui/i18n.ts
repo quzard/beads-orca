@@ -73,3 +73,75 @@ export function hostLabel(name: string | null | undefined): string {
   if (!name || name === 'local' || name === 'Local') return t('Local', '本机');
   return name;
 }
+
+/** 只改显示。交给 bd 的值仍是英文键。 */
+export function typeLabel(type: string): string {
+  switch (type) {
+    case 'task': return t('task', '任务');
+    case 'bug': return t('bug', '缺陷');
+    case 'feature': return t('feature', '功能');
+    case 'chore': return t('chore', '杂项');
+    case 'epic': return t('epic', '史诗');
+    case 'decision': return t('decision', '决策');
+    case 'spike': return t('spike', '预研');
+    case 'story': return t('story', '故事');
+    case 'milestone': return t('milestone', '里程碑');
+    default: return type;
+  }
+}
+
+export function statusLabel(status: string): string {
+  switch (status) {
+    case 'open': return t('Open', '未解决');
+    case 'in_progress': return t('In progress', '进行中');
+    case 'blocked': return t('Blocked', '阻塞');
+    case 'deferred': return t('Deferred', '推迟');
+    case 'closed': return t('Closed', '已关闭');
+    default: return status;
+  }
+}
+
+export function relationLabel(type: string): string {
+  switch (type) {
+    case 'blocks': return t('blocks', '阻塞');
+    case 'parent-child': return t('parent-child', '父子');
+    case 'related': return t('related', '相关');
+    case 'discovered-from': return t('discovered-from', '发现自');
+    default: return type;
+  }
+}
+
+export function modeLabel(mode: string): string {
+  if (mode === 'implementation') return t('implementation', '实现');
+  if (mode === 'research') return t('research', '研究');
+  return mode;
+}
+
+export function deliveryLabel(value: string): string {
+  switch (value) {
+    case 'draft': return t('draft', '草稿');
+    case 'handed-to-terminal': return t('handed-to-terminal', '已发到终端');
+    case 'journaled': return t('journaled', '已记录');
+    case 'rejected': return t('rejected', '已拒绝');
+    case 'unknown': return t('unknown', '未知');
+    default: return value;
+  }
+}
+
+export function outcomeLabel(value: string): string {
+  switch (value) {
+    case 'completed': return t('completed', '完成');
+    case 'partial': return t('partial', '做了一部分');
+    case 'blocked': return t('blocked', '阻塞');
+    case 'not-started': return t('not-started', '没开始');
+    case 'published': return t('published', '已写入');
+    case 'unknown': return t('unknown', '未知');
+    default: return value;
+  }
+}
+
+export function scopeLabel(scope: string): string {
+  if (scope === 'personal') return t('personal', '个人');
+  if (scope === 'project') return t('project', '项目');
+  return scope;
+}

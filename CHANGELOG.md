@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5-ssh.5 — 2026-11-09
+
+- Remaining panel chrome is Simplified Chinese: issue types, statuses, relationships, filters, empty states, buttons, and the errors the panel shows. Values sent to `bd` stay the English keys.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.4 — 2026-11-09
 
 - When Orca exposes `fork.host.exec`, Beads on a paired `runtime:` server runs through that API (`argv`, no shell) instead of a second SSH login. `fork.workspaces.list` discovers those workspaces. `remoteHosts` still overrides the destination.
