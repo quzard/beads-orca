@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5-ssh.8 — 2026-11-09
+
+- Reopening the panel follows the focused Orca workspace, including an SSH worktree, using its name, branch, and terminal path. A local folder such as Documents is not chosen while that workspace is focused.
+- Workspaces without a `.beads` directory are left out of the list. If the focused workspace is not initialized, the panel uses another initialized workspace instead.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.7 — 2026-11-09
 
 - Reopening the panel selects the workspace Orca currently has focused. The last manual choice is used only when that focus is missing or matches more than one workspace.

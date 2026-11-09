@@ -34,7 +34,7 @@ test('workspaces on unsupported hosts remain visible and cannot reach a local Be
     },
   });
   const projects = await transport.request<Project[]>({ method: 'projects' });
-  assert.deepEqual(projects.map((project) => project.id), ['local-current', 'local-legacy', 'ssh-project', 'wsl-project', 'paired-project']);
+  assert.deepEqual(projects.map((project) => project.id), ['ssh-project', 'wsl-project', 'paired-project']);
   for (const project of ['ssh-project', 'wsl-project', 'paired-project']) {
     assert.equal(projects.find((candidate) => candidate.id === project)?.availability, 'unsupported');
     await assert.rejects(transport.request({ method: 'snapshot', project }), /unsupported|mapping/i);

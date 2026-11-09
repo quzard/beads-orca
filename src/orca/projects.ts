@@ -1,12 +1,13 @@
 import { execFile, type ExecFileException } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
-import { basename, isAbsolute, posix } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { basename, isAbsolute, join, posix } from 'node:path';
 import { promisify } from 'node:util';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { bashCommand, executeSsh, finishForkCommand, handleRequest, ProjectUnavailableError, quoteRemote, remoteShellScript, RemoteCommandError, RemoteUnavailableError, type CommandOptions, type RemoteRun, type SshTarget } from '../core/service.js';
 import type { Project, ProjectAvailability, RpcRequest, Snapshot } from '../shared.js';
 import { t } from '../ui/i18n.js';
+import { focusedWorkspaceId, type FocusContext } from '../ui/project-selection.js';
 import { forkAvailable, forkExec, forkHosts, forkWorkspaces, ForkServerTooOld, type ForkCaller, type ForkHostRow, type ForkWorkspaceRow } from './fork-host.js';
 
 export interface ProductHost {
@@ -357,8 +358,11 @@ export class ProjectAccess {
 
   private async discover(): Promise<Discovery> {
     const catalog = await this.forkCatalog();
-    if (catalog) return this.discoverFromFork(catalog);
-    return this.discoverConfigured();
+    const discovery = catalog ? await this.discoverFromFork(catalog) : await this.discoverConfigured();
+    // fork.workspaces.list 只挂在 runtime 上。SSH 主机的 worktree 仍在 workspace.list 里。
+    if (catalog) await this.appendMissingDesktopWorkspaces(discovery);
+    await this.applyFocus(discovery);
+    return discovery;
   }
 
   private async forkCatalog(): Promise<{ hosts: ForkHostRow[]; workspaces: ForkWorkspaceRow[]; unreachable: string[] } | null> {
@@ -403,10 +407,6 @@ export class ProjectAccess {
   private async discoverFromFork(catalog: { hosts: ForkHostRow[]; workspaces: ForkWorkspaceRow[]; unreachable: string[] }): Promise<Discovery> {
     const mappings = remoteMappings(await this.host.settings.get('remoteHosts'));
     const byHost = new Map(catalog.hosts.map((host) => [host.hostId, host]));
-    let context: { displayName?: string; branch?: string } | null = null;
-    try { context = await this.host.host.call('workspace.readContext') as { displayName?: string; branch?: string } | null; } catch { /* Focus is optional. */ }
-    const matches = context ? catalog.workspaces.filter((workspace) => workspace.name === context?.displayName && (workspace.branch ?? '') === (context?.branch ?? '')) : [];
-    const currentId = matches.length === 1 ? matches[0]?.id : undefined;
     const targets = new Map<string, SshTarget>();
     const forks = new Map<string, ForkBinding>();
     const keys = new Map<string, string>();
@@ -426,8 +426,7 @@ export class ProjectAccess {
       const project: Project = {
         id: pluginId, name: workspace.name, path: workspace.path, hostId,
         ...(local ? { hostName: 'Local' } : { hostName: override?.name || row?.label || alias }),
-        workspaceId: workspace.id,
-        ...(currentId === undefined ? {} : { current: workspace.id === currentId && workspace.hostId === matches[0]?.hostId }),
+        workspaceId: workspace.id, ...(workspace.branch !== undefined ? { branch: workspace.branch } : {}),
       };
       const key = projectKey(project, useFork ? undefined : ssh);
       keys.set(project.id, key);
@@ -496,10 +495,6 @@ export class ProjectAccess {
       return typeof hostId === 'string' && hostId.startsWith('ssh:') && !mappings.has(hostId);
     });
     const lookup = needsAlias ? await this.sshAliasLookup() : { aliases: new Map<string, string>(), rejected: new Map<string, string>() };
-    let context: { displayName?: string; branch?: string } | null = null;
-    try { context = await this.host.host.call('workspace.readContext') as { displayName?: string; branch?: string } | null; } catch { /* Focus is optional. */ }
-    const matches = context ? listed.workspaces.filter((workspace) => workspace.name === context?.displayName && (workspace.branch ?? '') === (context?.branch ?? '')) : [];
-    const currentId = matches.length === 1 ? matches[0]?.id : undefined;
     const targets = new Map<string, SshTarget>();
     const keys = new Map<string, string>();
     const projects: Project[] = [];
@@ -514,7 +509,7 @@ export class ProjectAccess {
       const project: Project = {
         id: workspace.id, name: workspace.name, path: workspace.path, hostId,
         ...(local ? { hostName: 'Local' } : target?.name ? { hostName: target.name } : {}), workspaceId: workspace.id,
-        ...(currentId === undefined ? {} : { current: workspace.id === currentId }),
+        ...(workspace.branch !== undefined ? { branch: workspace.branch } : {}),
       };
       const key = projectKey(project, target);
       keys.set(project.id, key);
@@ -536,8 +531,118 @@ export class ProjectAccess {
     return { projects, targets, forks: new Map(), keys };
   }
 
+  private placeKey(hostId: string | null | undefined, path: string): string {
+    const host = !hostId || hostId === 'local' ? 'local' : hostId;
+    return `${host}\0${path.replace(/\/+$/, '') || '/'}`;
+  }
+
+  /** SSH worktrees live on workspace.list even when fork.workspaces.list only has runtime rows. */
+  private async appendMissingDesktopWorkspaces(discovery: Discovery): Promise<void> {
+    let listed: { workspaces?: Workspace[] };
+    try { listed = await this.host.host.call('workspace.list') as { workspaces?: Workspace[] }; }
+    catch { return; }
+    if (!listed || !Array.isArray(listed.workspaces)) return;
+    const present = new Set(discovery.projects.map((project) => this.placeKey(project.hostId, project.path)));
+    const extra = listed.workspaces.filter((workspace) => workspace && typeof workspace.path === 'string' && typeof workspace.id === 'string' && typeof workspace.name === 'string' && !present.has(this.placeKey(workspace.hostId ?? null, workspace.path)));
+    if (!extra.length) return;
+    const mappings = remoteMappings(await this.host.settings.get('remoteHosts'));
+    const needsAlias = extra.some((workspace) => {
+      const hostId = workspace.hostId;
+      return typeof hostId === 'string' && hostId.startsWith('ssh:') && !mappings.has(hostId);
+    });
+    const lookup = needsAlias ? await this.sshAliasLookup() : { aliases: new Map<string, string>(), rejected: new Map<string, string>() };
+    for (const workspace of extra) {
+      const hostId = workspace.hostId ?? null;
+      const local = hostId === null || hostId === 'local';
+      const target = local ? undefined : mappings.get(hostId ?? '') ?? this.aliasTarget(hostId, lookup);
+      const project: Project = {
+        id: workspace.id, name: workspace.name, path: workspace.path, hostId,
+        ...(local ? { hostName: 'Local' } : target?.name ? { hostName: target.name } : {}), workspaceId: workspace.id,
+        ...(workspace.branch !== undefined ? { branch: workspace.branch } : {}),
+      };
+      const key = projectKey(project, target);
+      discovery.keys.set(project.id, key);
+      if (target) discovery.targets.set(project.id, target);
+      const status = this.state.get(key);
+      if (!local && !target) {
+        project.availability = 'unsupported';
+        project.availabilityReason = unsupportedHostReason(hostId ?? '', lookup);
+      } else {
+        project.availability = status?.availability ?? 'unknown';
+        if (status?.reason) project.availabilityReason = status.reason;
+        if (status?.lastFetchedAt) project.lastFetchedAt = status.lastFetchedAt;
+        if (status?.cacheError) project.cacheError = status.cacheError;
+      }
+      discovery.projects.push(project);
+    }
+  }
+
+  private async applyFocus(discovery: Discovery): Promise<void> {
+    let context: FocusContext | null = null;
+    try { context = await this.host.host.call('workspace.readContext') as FocusContext | null; }
+    catch { context = null; }
+    const id = focusedWorkspaceId(discovery.projects.map((project) => ({
+      id: project.id, name: project.name, path: project.path, hostId: project.hostId, branch: project.branch,
+    })), context);
+    for (const project of discovery.projects) delete project.current;
+    const match = id ? discovery.projects.find((project) => project.id === id) : undefined;
+    if (match) match.current = true;
+  }
+
+  private async localHasBeads(path: string): Promise<boolean> {
+    try {
+      const stat = await lstat(join(path, '.beads'));
+      return stat.isDirectory() || stat.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  }
+
+  /** true 有 .beads，false 确认没有，null 查不了（主机不可达或没有连接）。 */
+  private async remoteHasBeads(project: Project, discovery: Discovery): Promise<boolean | null> {
+    const transport = { target: discovery.targets.get(project.id), fork: discovery.forks.get(project.id) };
+    if (!transport.target && !transport.fork) return null;
+    try {
+      await this.withTransport(transport, async ({ target, options }) => {
+        const script = `cd -- ${quoteRemote(project.path)} || exit 125\ntest -d .beads`;
+        if (options.remoteRun) {
+          await options.remoteRun(script, { timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: 1024, context: 'exec' });
+          return;
+        }
+        if (target) {
+          await executeSsh(target, bashCommand(script, this.remotePath), { timeoutMs: options.timeoutMs ?? PROCESS_TIMEOUT_MS, maxBuffer: 1024, context: 'exec' });
+          return;
+        }
+        const execution = executeFile('sh', ['-c', 'cd -- "$1" && test -d .beads', 'probe', project.path], {
+          encoding: 'utf8', shell: false, timeout: PROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 1024,
+        });
+        execution.child.stdin?.end();
+        await execution;
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof RemoteUnavailableError) return null;
+      if (error instanceof RemoteCommandError) return false;
+      const code = (error as ExecFileException).code;
+      if (code === 1 || code === 125) return false;
+      return null;
+    }
+  }
+
+  private async beadsInitialized(project: Project, discovery: Discovery): Promise<boolean> {
+    const local = !project.hostId || project.hostId === 'local' || project.id.startsWith('path:');
+    if (local) return this.localHasBeads(project.path);
+    const remote = await this.remoteHasBeads(project, discovery);
+    return remote !== false;
+  }
+
   async list(): Promise<Project[]> {
-    return (await this.discover()).projects;
+    const discovered = await this.discover();
+    const visible: Project[] = [];
+    for (const project of discovered.projects) {
+      if (await this.beadsInitialized(project, discovered)) visible.push(project);
+    }
+    return visible;
   }
 
   private async resolve(projectId: string): Promise<{ project: Project; target?: SshTarget; fork?: ForkBinding; key: string; projects: Project[] }> {
@@ -663,7 +768,13 @@ export class ProjectAccess {
     if (request?.method === 'diagnostics') return this.diagnostics(await this.list());
     if (request?.method === 'ssh.test') return this.testSsh(typeof request.project === 'string' ? request.project : '');
     const discovery = await this.discover();
-    if (request?.method === 'projects') return handleRequest(request, discovery.projects);
+    if (request?.method === 'projects') {
+      const visible: Project[] = [];
+      for (const project of discovery.projects) {
+        if (await this.beadsInitialized(project, discovery)) visible.push(project);
+      }
+      return handleRequest(request, visible);
+    }
     const project = discovery.projects.find((candidate) => candidate.id === request?.project);
     const key = project && discovery.keys.get(project.id);
     if (!project || !key) throw new Error('A registered project ID is required');

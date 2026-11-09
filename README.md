@@ -10,12 +10,12 @@
 
 ## Install the stable release
 
-Current release: **v0.2.5-ssh.7**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review. The panel is Simplified Chinese unless Orca's UI language is English.
+Current release: **v0.2.5-ssh.8**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review. The panel is Simplified Chinese unless Orca's UI language is English.
 
 In Orca, open **Settings → Plugins → Add plugin → From Git URL** and enter:
 
 ```text
-https://github.com/quzard/beads-orca#v0.2.5-ssh.7
+https://github.com/quzard/beads-orca#v0.2.5-ssh.8
 ```
 
 Alternatively, use the [Orca community catalog](https://onorca.dev/plugins/roflochinsky.beads?catalog=community) once listed. Check the [listing status](https://www.onorca.dev/plugins/roflochinsky/beads-orca) if it is not available there; Git installation does not require a community listing.

@@ -9,6 +9,8 @@ export interface Project {
   hostName?: string;
   /** Null for an additional local path which is not an Orca workspace. */
   workspaceId?: string | null;
+  /** Git branch. Null for a folder workspace or an extra local path. */
+  branch?: string | null;
   /** Omitted when the focused workspace cannot be identified unambiguously. */
   current?: boolean;
   availability?: ProjectAvailability;

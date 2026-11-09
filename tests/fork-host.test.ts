@@ -69,9 +69,10 @@ test('paired runtime workspaces use fork.host.exec, and ssh remains the override
     assert.equal(projects.some((project) => project.hostId === 'ssh:abc'), false);
     const diagnostics = await access.request({ method: 'diagnostics' }) as { pathErrors: string[] };
     assert.match(diagnostics.pathErrors.join('\n'), /runtime:down/);
+    await rm(sshArgs, { force: true });
     const snapshot = await access.request({ method: 'snapshot', project: 'runtime:mini::remote-ws' }) as Snapshot;
     assert.equal(snapshot.offline, false);
-    const exec = execs[0] as { argv: string[]; stdin: string; hostId: string; workspaceId: string };
+    const exec = execs.find((item) => (item as { stdin?: string }).stdin?.includes('bd ')) as { argv: string[]; stdin: string; hostId: string; workspaceId: string };
     assert.deepEqual(exec.argv, ['bash', '--noprofile', '--norc', '-s']);
     assert.equal(exec.hostId, 'runtime:mini');
     assert.equal(exec.workspaceId, 'remote-ws');

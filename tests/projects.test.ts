@@ -25,8 +25,9 @@ function fixtureHost(workspaces: Workspace[], settings: Record<string, string> =
 }
 
 test('project discovery keeps remote and unsupported host identities distinct from a local twin', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'beads-projects-'));
+    const root = await mkdtemp(join(tmpdir(), 'beads-projects-'));
   try {
+    await mkdir(join(root, '.beads'));
     const workspaces: Workspace[] = [
       { id: 'local', name: 'Local', path: root, hostId: null },
       { id: 'ssh', name: 'Remote twin', path: root, hostId: 'ssh:example' },
@@ -52,21 +53,56 @@ test('project discovery keeps remote and unsupported host identities distinct fr
 });
 
 test('focused workspace is identified only when the available host context is unambiguous', async () => {
-  const workspaces: Workspace[] = [
-    { id: 'one', name: 'Same name', branch: 'main', path: '/first', hostId: null },
-    { id: 'two', name: 'Same name', branch: 'main', path: '/second', hostId: 'runtime:other' },
-  ];
-  const base = fixtureHost(workspaces);
-  const service = new ProjectAccess({
-    settings: base.settings,
-    host: { async call(method, params) {
-      if (method === 'workspace.readContext') return { displayName: 'Same name', branch: 'main', terminals: [] };
-      return base.host.call(method, params);
-    } },
-  });
-  assert.deepEqual((await service.list()).map((project) => project.current), [undefined, undefined]);
-  workspaces.pop();
-  assert.equal((await service.list())[0]?.current, true);
+  const root = await mkdtemp(join(tmpdir(), 'beads-focus-'));
+  const first = join(root, 'first');
+  const second = join(root, 'second');
+  await mkdir(join(first, '.beads'), { recursive: true });
+  await mkdir(join(second, '.beads'), { recursive: true });
+  try {
+    const workspaces: Workspace[] = [
+      { id: 'one', name: 'Same name', branch: 'main', path: first, hostId: null },
+      { id: 'two', name: 'Same name', branch: 'main', path: second, hostId: 'runtime:other' },
+    ];
+    const base = fixtureHost(workspaces);
+    const service = new ProjectAccess({
+      settings: base.settings,
+      host: { async call(method, params) {
+        if (method === 'workspace.readContext') return { displayName: 'Same name', branch: 'main', terminals: [] };
+        return base.host.call(method, params);
+      } },
+    });
+    assert.deepEqual((await service.list()).map((project) => project.current), [undefined, undefined]);
+    workspaces.pop();
+    assert.equal((await service.list())[0]?.current, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an uninitialized local folder is hidden and the focused ssh workspace is selected', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-hide-uninit-'));
+  const documents = join(root, 'Documents');
+  const remote = join(root, 'upsert-umodel-perf');
+  await mkdir(documents);
+  await mkdir(join(remote, '.beads'), { recursive: true });
+  try {
+    const service = new ProjectAccess({
+      settings: { async get() { return ''; } },
+      host: { async call(method) {
+        if (method === 'workspace.list') return { workspaces: [
+          { id: 'docs', name: 'Documents', path: documents, hostId: null, branch: null },
+          { id: 'remote', name: 'upsert-umodel-perf', path: remote, hostId: 'ssh:new_sls', branch: 'main' },
+        ], truncated: false };
+        if (method === 'workspace.readContext') return { displayName: 'upsert-umodel-perf', branch: 'refs/heads/main', terminals: [] };
+        throw new Error(`Unexpected host method: ${method}`);
+      } },
+    });
+    const projects = await service.list();
+    assert.deepEqual(projects.map((project) => project.id), ['remote']);
+    assert.equal(projects[0]?.current, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('confined text access refuses traversal and symlinks, creates parents, and removes only the named file', async () => {
@@ -280,8 +316,9 @@ test('remote native writes pin the remote store and treat issue text as data, no
 });
 
 test('one bad additional path does not hide the other projects', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'beads-paths-'));
+    const root = await mkdtemp(join(tmpdir(), 'beads-paths-'));
   try {
+    await mkdir(join(root, '.beads'));
     const service = new ProjectAccess(fixtureHost(
       [{ id: 'local', name: 'Local', path: root, hostId: null }],
       { projectPaths: `${join(root, 'missing')}\n${root}` },
@@ -418,11 +455,13 @@ test('SSH workspaces take the Orca host-list name as the default alias, and remo
 
 test('a missing Orca CLI does not drop local projects', async () => {
   const previousCli = process.env.ORCA_CLI_COMMAND;
+  const root = await mkdtemp(join(tmpdir(), 'beads-no-cli-'));
   process.env.ORCA_CLI_COMMAND = '/no/such/orca-host-list';
   try {
+    await mkdir(join(root, '.beads'));
     const access = new ProjectAccess(fixtureHost([
-      { id: 'local', name: 'Local', path: '/tmp', hostId: null },
-      { id: 'ssh', name: 'Remote', path: '/tmp', hostId: 'ssh:missing' },
+      { id: 'local', name: 'Local', path: root, hostId: null },
+      { id: 'ssh', name: 'Remote', path: root, hostId: 'ssh:missing' },
     ]));
     const projects = await access.list();
     assert.equal(projects[0]?.id, 'local');
@@ -432,5 +471,6 @@ test('a missing Orca CLI does not drop local projects', async () => {
     assert.match(projects[1]?.availabilityReason ?? '', /Could not read Orca SSH hosts/);
   } finally {
     if (previousCli === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previousCli;
+    await rm(root, { recursive: true, force: true });
   }
 });
