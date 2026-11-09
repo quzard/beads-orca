@@ -352,3 +352,85 @@ test('SSH connection test reports bd, python3, and the physical workspace', asyn
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('SSH workspaces take the Orca host-list name as the default alias, and remoteHosts overrides it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-alias-'));
+  const previousPath = process.env.PATH;
+  const previousCli = process.env.ORCA_CLI_COMMAND;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const calls = join(root, 'host-list-calls');
+    const sshArgs = join(root, 'ssh-args.json');
+    const configFile = join(root, 'other-config');
+    await mkdir(bin);
+    await mkdir(join(workspace, '.beads'), { recursive: true });
+    await writeFile(configFile, 'Host override\n  HostName 127.0.0.1\n');
+    const hosts = {
+      hosts: [
+        { kind: 'ssh', id: 'ssh target', name: 'new_sls' },
+        { kind: 'ssh', id: 'renamed', name: 'Not An Alias' },
+        { kind: 'ssh', id: 'kept', name: 'mini' },
+        { kind: 'ssh', id: 'dup', name: 'one' },
+        { kind: 'ssh', id: 'dup', name: 'two' },
+        { kind: 'local', id: 'local', name: 'This computer' },
+      ],
+    };
+    await writeFile(join(bin, 'orca'), `#!${process.execPath}\nconst fs=require('node:fs');\nconst n=fs.existsSync(${JSON.stringify(calls)})?Number(fs.readFileSync(${JSON.stringify(calls)},'utf8')):0;\nfs.writeFileSync(${JSON.stringify(calls)},String(n+1));\nprocess.stdout.write(JSON.stringify({ok:true,result:${JSON.stringify(hosts)}}));\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst fs=require('node:fs'); const cp=require('node:child_process');\nfs.writeFileSync(${JSON.stringify(sshArgs)},JSON.stringify(process.argv.slice(2)));\nconst result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nprocess.stdout.write('[]');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    process.env.ORCA_CLI_COMMAND = join(bin, 'orca');
+    const encoded = `ssh:${encodeURIComponent('ssh target')}`;
+    const service = new ProjectAccess(fixtureHost([
+      { id: 'local', name: 'Local', path: workspace, hostId: null },
+      { id: 'auto', name: 'Auto', path: workspace, hostId: encoded },
+      { id: 'renamed', name: 'Renamed', path: workspace, hostId: 'ssh:renamed' },
+      { id: 'dup', name: 'Dup', path: workspace, hostId: 'ssh:dup' },
+      { id: 'kept', name: 'Kept', path: workspace, hostId: 'ssh:kept' },
+    ], {
+      remoteHosts: JSON.stringify({ 'ssh:kept': { destination: 'override', configFile, name: 'Override label' } }),
+    }));
+    const projects = await service.list();
+    assert.equal(projects.find((project) => project.id === 'local')?.availability, 'unknown');
+    assert.equal(projects.find((project) => project.id === 'auto')?.hostName, 'new_sls');
+    assert.equal(projects.find((project) => project.id === 'auto')?.availability, 'unknown');
+    assert.match(projects.find((project) => project.id === 'renamed')?.availabilityReason ?? '', /Not An Alias/);
+    assert.equal(projects.find((project) => project.id === 'dup')?.availability, 'unsupported');
+    assert.equal(projects.find((project) => project.id === 'kept')?.hostName, 'Override label');
+    await service.list();
+    assert.equal(await readFile(calls, 'utf8'), '1');
+    await service.request({ method: 'snapshot', project: 'auto' });
+    const autoArgs = JSON.parse(await readFile(sshArgs, 'utf8')) as string[];
+    assert.equal(autoArgs.includes('-F'), false);
+    assert.equal(autoArgs.includes('new_sls'), true);
+    await service.request({ method: 'snapshot', project: 'kept' });
+    const overrideArgs = JSON.parse(await readFile(sshArgs, 'utf8')) as string[];
+    assert.equal(overrideArgs[overrideArgs.indexOf('-F') + 1], configFile);
+    assert.equal(overrideArgs.includes('override'), true);
+    assert.equal(overrideArgs.includes('mini'), false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousCli === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previousCli;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a missing Orca CLI does not drop local projects', async () => {
+  const previousCli = process.env.ORCA_CLI_COMMAND;
+  process.env.ORCA_CLI_COMMAND = '/no/such/orca-host-list';
+  try {
+    const access = new ProjectAccess(fixtureHost([
+      { id: 'local', name: 'Local', path: '/tmp', hostId: null },
+      { id: 'ssh', name: 'Remote', path: '/tmp', hostId: 'ssh:missing' },
+    ]));
+    const projects = await access.list();
+    assert.equal(projects[0]?.id, 'local');
+    assert.equal(projects[0]?.availability, 'unknown');
+    assert.equal(projects[1]?.availability, 'unsupported');
+    assert.match(projects[1]?.availabilityReason ?? '', /Unsupported host ssh:missing/);
+    assert.match(projects[1]?.availabilityReason ?? '', /Could not read Orca SSH hosts/);
+  } finally {
+    if (previousCli === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previousCli;
+  }
+});

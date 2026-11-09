@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5-ssh.2 — 2026-11-09
+
+- SSH workspaces whose Orca host name is a `~/.ssh/config` Host alias connect without `remoteHosts`. The plugin reads `orca host list` and uses that name as `ssh` destination, with no `-F`, so OpenSSH reads the default config.
+- `remoteHosts` remains an override for a renamed Orca host, a different destination, or another config file. Paired `runtime:` hosts still need an explicit entry.
+- `engines.orca` stays `>=1.4.250`.
+
 ## 0.2.5-ssh.1 — 2026-11-09
 
 - Remote Beads commands now start with `env bash --noprofile --norc` and a configurable PATH, so a login shell (`fish`, `zsh`, or `.bashrc`) cannot alias or wrap `bd` and `python3`.

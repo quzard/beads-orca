@@ -43,6 +43,11 @@ const PROCESS_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 30_000;
 // Each plugin storage value is limited to 256 KiB, with 5 MiB shared by the plugin.
 const CACHE_CHUNK_SIZE = 128 * 1024;
+// 与 remoteHosts.destination 同一套语法：只能是 OpenSSH 的 Host 别名，不能是命令。
+const SSH_DESTINATION = /^[A-Za-z0-9_][A-Za-z0-9_.+@:-]*$/u;
+// 面板每次请求都会 discover。别名在一次 Orca 会话里很少变，避免每次都拉起 CLI。
+const SSH_ALIAS_TTL_MS = 30_000;
+const HOST_LIST_TIMEOUT_MS = 10_000;
 const MUTATIONS: Record<string, true> = {
   create: true, update: true, claim: true, close: true, reopen: true,
   reclaim: true, link: true, unlink: true, comment: true,
@@ -77,7 +82,7 @@ function remoteMappings(value: unknown): Map<string, RemoteMapping> {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`remoteHosts entry ${hostId} must be an object`);
     const record = entry as Record<string, unknown>;
     if (Object.keys(record).some((key) => key !== 'destination' && key !== 'configFile' && key !== 'name') ||
-        typeof record.destination !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.+@:-]*$/u.test(record.destination) ||
+        typeof record.destination !== 'string' || !SSH_DESTINATION.test(record.destination) ||
         (record.configFile !== undefined && (typeof record.configFile !== 'string' || !isAbsolute(record.configFile) || record.configFile.includes('\0'))) ||
         (record.name !== undefined && (typeof record.name !== 'string' || !record.name.trim() || record.name.length > 128 || /[\u0000-\u001f]/u.test(record.name)))) {
       throw new Error(`remoteHosts entry ${hostId} requires an SSH destination, optional absolute configFile, and optional display name`);
@@ -210,6 +215,86 @@ except (OSError, UnicodeError, ValueError) as exc:
     print(json.dumps({'ok': False, 'code': code, 'message': str(exc)}))
 `;
 
+type SshAliasLookup = {
+  aliases: Map<string, string>;
+  /** hostId → Orca 里看到的名字。该名字不是合法的 SSH config 别名。 */
+  rejected: Map<string, string>;
+  error?: string;
+};
+
+function orcaCliExecutable(): string {
+  // 与 NativeWorkflowCli 相同：桌面用 orca，Linux 包用 orca-ide，开发树用 orca-dev。
+  return process.env.ORCA_CLI_COMMAND || (process.env.ORCA_DEV_REPO_ROOT ? 'orca-dev' : process.platform === 'linux' ? 'orca-ide' : 'orca');
+}
+
+function briefCliError(error: unknown): string {
+  return errorMessage(error).replace(/\s+/gu, ' ').slice(0, 180);
+}
+
+/**
+ * `orca host list` 的 ssh 项：id 是内部 target id，name 是标签。
+ * 从 ~/.ssh/config 同步时，标签和 configHost 都写成 Host 别名（new_sls、mini）。
+ * workspace.hostId 是 `ssh:` + encodeURIComponent(target.id)，不是别名本身。
+ * 列表不返回 user/host/port/identity，所以这里只取别名，连接参数留给默认 SSH config。
+ */
+function sshAliasesFromHostList(result: unknown): { aliases: Map<string, string>; rejected: Map<string, string> } {
+  if (!result || typeof result !== 'object' || !Array.isArray((result as { hosts?: unknown }).hosts)) {
+    throw new Error('orca host list returned no hosts');
+  }
+  const chosen = new Map<string, { alias: string } | { reject: string }>();
+  for (const entry of (result as { hosts: unknown[] }).hosts) {
+    if (!entry || typeof entry !== 'object') continue;
+    const host = entry as { kind?: unknown; id?: unknown; name?: unknown };
+    if (host.kind !== 'ssh' || typeof host.id !== 'string' || !host.id || typeof host.name !== 'string') continue;
+    const next = SSH_DESTINATION.test(host.name) ? { alias: host.name } : { reject: host.name };
+    const previous = chosen.get(host.id);
+    if (!previous) chosen.set(host.id, next);
+    else if (!('alias' in previous) || !('alias' in next) || previous.alias !== next.alias) chosen.set(host.id, { reject: host.name });
+  }
+  const aliases = new Map<string, string>();
+  const rejected = new Map<string, string>();
+  for (const [id, value] of chosen) {
+    const keys = new Set([`ssh:${encodeURIComponent(id)}`, `ssh:${id}`]);
+    for (const key of keys) {
+      if ('alias' in value) aliases.set(key, value.alias);
+      else rejected.set(key, value.reject);
+    }
+  }
+  return { aliases, rejected };
+}
+
+async function readOrcaHostList(): Promise<unknown> {
+  const env = { ...process.env };
+  delete env.ORCA_PAIRING_CODE;
+  delete env.ORCA_ENVIRONMENT;
+  delete env.ELECTRON_RUN_AS_NODE;
+  const execution = executeFile(orcaCliExecutable(), ['host', 'list', '--json'], {
+    env, encoding: 'utf8', shell: false, timeout: HOST_LIST_TIMEOUT_MS, killSignal: 'SIGKILL',
+    maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+  });
+  execution.child.stdin?.end();
+  const { stdout } = await execution;
+  const envelope = JSON.parse(stdout) as { ok?: unknown; result?: unknown };
+  if (!envelope || envelope.ok !== true || !envelope.result || typeof envelope.result !== 'object') {
+    throw new Error('orca host list returned no hosts');
+  }
+  return envelope.result;
+}
+
+function unsupportedHostReason(hostId: string, lookup: SshAliasLookup): string {
+  if (!hostId.startsWith('ssh:')) {
+    return `Unsupported host ${hostId}. Paired runtime hosts need a remoteHosts SSH alias; there is no paired file adapter.`;
+  }
+  if (lookup.error) {
+    return `Unsupported host ${hostId}. Could not read Orca SSH hosts (${lookup.error}). Set remoteHosts.destination to the ~/.ssh/config Host alias.`;
+  }
+  const rejected = lookup.rejected.get(hostId);
+  if (rejected) {
+    return `Unsupported host ${hostId}. Orca host name "${rejected}" is not a ~/.ssh/config alias. Set remoteHosts.destination to that alias.`;
+  }
+  return `Unsupported host ${hostId}. It is not in \`orca host list\` as an SSH alias. Sync ~/.ssh/config, or set remoteHosts.destination.`;
+}
+
 export function remoteHostsExample(hostId: string): string {
   return JSON.stringify({ [hostId]: { destination: 'linux-dev', configFile: '/Users/you/.ssh/config', name: 'Linux dev' } }, null, 2);
 }
@@ -226,6 +311,7 @@ function positiveSeconds(value: unknown, fallback: number, max: number): number 
 
 export class ProjectAccess {
   private readonly state = new Map<string, AvailabilityState>();
+  private sshAliasCache: { at: number; lookup: SshAliasLookup } | null = null;
   private readonly cacheQueues = new Map<string, Promise<void>>();
   private pathErrors: string[] = [];
   private remotePath = '';
@@ -234,11 +320,37 @@ export class ProjectAccess {
 
   constructor(private readonly host: ProductHost) {}
 
+  /** 自动别名不带 -F。用户若改了 Orca 显示名，或要用另一份 config，仍写 remoteHosts。 */
+  private aliasTarget(hostId: string | null, lookup: SshAliasLookup): RemoteMapping | undefined {
+    if (!hostId) return undefined;
+    const destination = lookup.aliases.get(hostId);
+    if (!destination) return undefined;
+    return { destination, name: destination };
+  }
+
+  private async sshAliasLookup(): Promise<SshAliasLookup> {
+    const cached = this.sshAliasCache;
+    if (cached && Date.now() - cached.at < SSH_ALIAS_TTL_MS) return cached.lookup;
+    try {
+      const lookup = sshAliasesFromHostList(await readOrcaHostList());
+      this.sshAliasCache = { at: Date.now(), lookup };
+      return lookup;
+    } catch (error) {
+      // 失败不缓存：下一次请求再试。本地项目不依赖这次查询。
+      return { aliases: new Map(), rejected: new Map(), error: briefCliError(error) };
+    }
+  }
+
   private async discover(): Promise<Discovery> {
     const listed = await this.host.host.call('workspace.list') as { workspaces?: Workspace[]; truncated?: boolean };
     if (!listed || !Array.isArray(listed.workspaces)) throw new Error('Orca returned an invalid workspace list');
     if (listed.truncated) throw new Error('Orca truncated its workspace list. Narrow the registered workspaces before using Beads.');
     const mappings = remoteMappings(await this.host.settings.get('remoteHosts'));
+    const needsAlias = listed.workspaces.some((workspace) => {
+      const hostId = workspace?.hostId;
+      return typeof hostId === 'string' && hostId.startsWith('ssh:') && !mappings.has(hostId);
+    });
+    const lookup = needsAlias ? await this.sshAliasLookup() : { aliases: new Map<string, string>(), rejected: new Map<string, string>() };
     let context: { displayName?: string; branch?: string } | null = null;
     try { context = await this.host.host.call('workspace.readContext') as { displayName?: string; branch?: string } | null; } catch { /* Focus is optional. */ }
     const matches = context ? listed.workspaces.filter((workspace) => workspace.name === context?.displayName && (workspace.branch ?? '') === (context?.branch ?? '')) : [];
@@ -252,7 +364,8 @@ export class ProjectAccess {
       }
       const hostId = workspace.hostId ?? null;
       const local = hostId === null || hostId === 'local';
-      const target = local ? undefined : mappings.get(hostId ?? '');
+      // remoteHosts 同 key 整条覆盖自动别名，包括 destination、configFile 和显示名。
+      const target = local ? undefined : mappings.get(hostId ?? '') ?? this.aliasTarget(hostId, lookup);
       const project: Project = {
         id: workspace.id, name: workspace.name, path: workspace.path, hostId,
         ...(local ? { hostName: 'Local' } : target?.name ? { hostName: target.name } : {}), workspaceId: workspace.id,
@@ -264,7 +377,7 @@ export class ProjectAccess {
       const status = this.state.get(key);
       if (!local && !target) {
         project.availability = 'unsupported';
-        project.availabilityReason = `Unsupported host ${hostId}. Open Hosts and copy the remoteHosts entry; destination is a Mac SSH alias, not an Orca connection.`;
+        project.availabilityReason = unsupportedHostReason(hostId ?? '', lookup);
       } else {
         project.availability = status?.availability ?? 'unknown';
         if (status?.reason) project.availabilityReason = status.reason;
@@ -550,7 +663,7 @@ export class ProjectAccess {
   /** 一条复用连接上的检查。登录 shell 不参与 bd/python 的查找。 */
   private async testSsh(projectId: string): Promise<{ ok: boolean; checks: SshCheck[] }> {
     const { project, target, key } = await this.resolve(projectId);
-    if (!target) return { ok: false, checks: [{ name: 'mapping', ok: false, detail: 'This project is local, or its host has no remoteHosts entry.' }] };
+    if (!target) return { ok: false, checks: [{ name: 'mapping', ok: false, detail: 'This project is local, or its SSH host has no alias.' }] };
     const script = [
       'if ! command -v bash >/dev/null 2>&1; then echo bash=missing; exit 0; fi',
       'echo bash=ok',

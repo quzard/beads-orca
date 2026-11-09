@@ -3,8 +3,8 @@
   "manifestVersion": 2,
   "id": "beads",
   "name": "Beads Board",
-  "version": "0.2.5-ssh.1",
-  "description": "Beads board, handoff previews, documents and personal history for local and explicitly mapped SSH workspaces.",
+  "version": "0.2.5-ssh.2",
+  "description": "Beads board, handoff previews, documents and personal history for local workspaces and SSH hosts named as ~/.ssh/config aliases.",
   "author": { "name": "Roflochinsky" },
   "repository": "https://github.com/Roflochinsky/beads-orca",
   "license": "MIT",
@@ -54,7 +54,7 @@
       {
         "key": "projectPaths",
         "title": "Additional local Beads project paths",
-        "description": "One absolute directory per line. Orca workspaces are included automatically. Remote hosts use an explicitly configured SSH destination.",
+        "description": "One absolute directory per line. Orca workspaces are included automatically. SSH workspaces use the Orca host name as a ~/.ssh/config alias.",
         "type": "string",
         "multiline": true,
         "default": ""
@@ -62,7 +62,7 @@
       {
         "key": "remoteHosts",
         "title": "Remote Beads SSH connections",
-        "description": "JSON mapping Orca host IDs to {destination, configFile?, name?}. destination is a system SSH alias; configFile is an optional absolute SSH config path; name is a portable display label for shared filters. Never store credentials here.",
+        "description": "Optional override of the automatic SSH alias. JSON mapping Orca host IDs to {destination, configFile?, name?}. destination replaces the host name from Orca; configFile is an optional absolute SSH config path; name is a portable display label. Leave empty when the Orca SSH host name is already the ~/.ssh/config Host alias. Never store credentials here.",
         "type": "string",
         "multiline": true,
         "default": "{}"
