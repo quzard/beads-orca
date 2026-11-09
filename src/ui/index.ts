@@ -1,4 +1,6 @@
 import type { Issue, Project, Snapshot, Transport } from '../shared.js';
+import { relationLabel, statusLabel, syncPanelLocale, t, typeLabel } from './i18n.js';
+import { preferredProjectId } from './project-selection.js';
 import { icon } from './icons.js';
 import { createProductUI } from './product.js';
 import { createIssueModel, issueGroupOrder, portableHostName, resolveEpicProject, selectIssues, virtualRange } from './model.js';
@@ -13,9 +15,16 @@ type EditDraft = { baseline: EditValues; values: EditValues };
 type Comment = { author: string; text: string; created_at: string };
 type SortKey = 'status' | 'id' | 'title' | 'priority' | 'relationships' | 'assignee' | 'type' | 'epic' | 'labels' | 'updated';
 
-const groupNames: Record<Group, string> = {
-  ready: 'Ready', active: 'In progress', blocked: 'Blocked', closed: 'Closed', deferred: 'Deferred', other: 'Other',
-};
+function groupLabel(group: Group): string {
+  switch (group) {
+    case 'ready': return t('Ready', '就绪');
+    case 'active': return t('In progress', '进行中');
+    case 'blocked': return t('Blocked', '阻塞');
+    case 'closed': return t('Closed', '已关闭');
+    case 'deferred': return t('Deferred', '已推迟');
+    default: return t('Other', '其他');
+  }
+}
 const groupOrder = issueGroupOrder;
 const types = ['task', 'bug', 'feature', 'chore', 'epic', 'decision', 'spike', 'story', 'milestone'];
 const typeIcons: Record<string, string> = {
@@ -24,6 +33,14 @@ const typeIcons: Record<string, string> = {
 };
 const editFields: Array<keyof EditValues> = ['title', 'description', 'priority', 'assignee', 'notes', 'acceptance', 'design'];
 const cleanups = new WeakMap<HTMLElement, () => void>();
+const LAST_PROJECT_KEY = 'beads-orca.lastProject';
+function rememberedProject(): string {
+  try { return globalThis.localStorage?.getItem(LAST_PROJECT_KEY) || ''; } catch { return ''; }
+}
+function rememberProject(id: string): void {
+  if (!id) return;
+  try { globalThis.localStorage?.setItem(LAST_PROJECT_KEY, id); } catch { /* The panel can still follow the focused workspace. */ }
+}
 const emptyDraft = (): Draft => ({ title: '', description: '', type: 'task', priority: '2', assignee: '', labels: '' });
 const escapeHtml = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c);
 const shell = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
@@ -37,10 +54,10 @@ function relativeTime(value: string): string {
   const time = Date.parse(value);
   if (!Number.isFinite(time)) return '';
   const minutes = Math.max(0, Math.floor((Date.now() - time) / 60_000));
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes}m ago`;
-  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ago`;
-  return `${Math.floor(minutes / 1440)}d ago`;
+  if (minutes < 1) return t("just now", "刚刚");
+  if (minutes < 60) return t('{n} min ago', '{n} 分钟前', { n: minutes });
+  if (minutes < 1440) return t('{n} h ago', '{n} 小时前', { n: Math.floor(minutes / 60) });
+  return t('{n} d ago', '{n} 天前', { n: Math.floor(minutes / 1440) });
 }
 
 function createCommand(draft: Draft): string {
@@ -71,7 +88,7 @@ function changedFields(draft: EditDraft): Record<string, unknown> {
 
 function updateCommand(id: string, changes: Record<string, unknown>): string {
   const flags = editFields.filter((field) => Object.hasOwn(changes, field)).map((field) => `--${field}=${shell(String(changes[field]))}`);
-  return flags.length ? ['bd', '--json', '--no-color', 'update', ...flags, '--', shell(id)].join(' ') : 'No changes to save';
+  return flags.length ? ['bd', '--json', '--no-color', 'update', ...flags, '--', shell(id)].join(' ') : t("No changes to save", "没有改动");
 }
 
 function actionCommand(method: string, id: string, dependsOn = '', type = 'blocks'): string {
@@ -152,6 +169,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
   let commentsSequence = 0;
   let undoClose: { project: string; id: string; updatedAt: string; closedAt?: string } | null = null;
   let projectLoadTask: Promise<void> | null = null;
+  let pathErrors: string[] = [];
+  let refreshMs = 15_000;
   let snapshotGeneration = 0;
   let detailOrigin: HTMLElement | null = null;
   let projectsReloadPending = false;
@@ -180,13 +199,13 @@ export function mount(root: HTMLElement, transport: Transport): void {
     applyCriteria: (criteria) => {
       const epicResolution = criteria.epic ? resolveEpicProject(projects, criteria.epic) : null;
       if (epicResolution && epicResolution.kind !== 'matched') {
-        actionError = epicResolution.kind === 'ambiguous' ? 'The saved epic matches multiple registered projects. Resolve the ambiguity before applying it.' : 'No registered project matches the saved epic’s project and host.';
+        actionError = epicResolution.kind === 'ambiguous' ? t("The saved epic matches multiple registered projects. Resolve the ambiguity before applying it.", "这个需求对上了多个项目，先处理完再应用。") : t("No registered project matches the saved epic’s project and host.", "没有项目同时对上这个需求的项目和主机。");
         return;
       }
       const match = epicResolution?.kind === 'matched' ? epicResolution.project : projects.find((project) => project.id === projectId && inScope(project, criteria))
         || projects.find((project) => inScope(project, criteria));
-      if (match && !inScope(match, criteria)) { actionError = 'The saved epic project is outside this filter scope.'; return; }
-      if ((criteria.projectNames.length || criteria.hostNames.length) && !match) { actionError = 'No available project matches this filter scope.'; return; }
+      if (match && !inScope(match, criteria)) { actionError = t("The saved epic project is outside this filter scope.", "需求所在项目不在当前筛选里。"); return; }
+      if ((criteria.projectNames.length || criteria.hostNames.length) && !match) { actionError = t("No available project matches this filter scope.", "没有项目落在这个筛选里。"); return; }
       scope = { projectNames: [...criteria.projectNames], hostNames: [...criteria.hostNames] };
       query = criteria.query; view = criteria.view; layout = criteria.layout; typeFilter = criteria.typeFilter;
       priorityFilter = criteria.priorityFilter; assigneeFilter = criteria.assigneeFilter; showClosed = criteria.showClosed;
@@ -223,17 +242,17 @@ export function mount(root: HTMLElement, transport: Transport): void {
   }
   function projectAvailability(project: Project): string {
     if (project.id === projectId) {
-      if (loadingSnapshot || loadingProjects) return snapshot ? offline() ? 'Refreshing · stale' : 'Refreshing' : 'Loading';
-      if (loadError || connectionLost) return snapshot ? 'Stale' : 'Unavailable';
-      if (snapshot?.offline || snapshot?.project.availability === 'offline') return 'Offline · stale';
-      if (snapshot?.project.availability === 'unsupported') return 'Unsupported';
-      if (snapshot) return 'Online';
+      if (loadingSnapshot || loadingProjects) return snapshot ? offline() ? t("Refreshing · stale", "刷新中 · 过期") : t("Refreshing", "刷新中") : t("Loading", "加载中");
+      if (loadError || connectionLost) return snapshot ? t("Stale", "过期") : t("Unavailable", "不可用");
+      if (snapshot?.offline || snapshot?.project.availability === 'offline') return t("Offline · stale", "离线 · 过期");
+      if (snapshot?.project.availability === 'unsupported') return t("Unsupported", "不支持");
+      if (snapshot) return t("Online", "在线");
     }
     switch (project.availability) {
-      case 'online': return 'Last checked online';
-      case 'offline': return 'Offline';
-      case 'unsupported': return 'Unsupported';
-      default: return 'Not checked';
+      case 'online': return t("Last checked online", "上次在线");
+      case 'offline': return t("Offline", "离线");
+      case 'unsupported': return t("Unsupported", "不支持");
+      default: return t("Not checked", "未检查");
     }
   }
   function projectSelect(): string {
@@ -245,39 +264,40 @@ export function mount(root: HTMLElement, transport: Transport): void {
     }
     const choices = projects.map((item) => {
       const key = JSON.stringify([item.name, item.path, item.hostId || 'local']);
-      const identity = (identities.get(key) || 0) > 1 ? ` · Workspace ID: ${item.workspaceId || item.id}` : '';
-      return `<button type="button" class="project-picker__option" data-action="choose-project" data-id="${escapeHtml(item.id)}" aria-current="${item.id === projectId ? 'true' : 'false'}"${inScope(item, scope) ? '' : ' disabled'}><span class="project-picker__option-title">${escapeHtml(projectBasename(item))}${item.current ? ' <span class="project-picker__current">Current workspace</span>' : ''}</span><span class="project-picker__meta">${escapeHtml(item.workspaceId ? `Workspace: ${item.name}` : 'Additional project path')} · ${escapeHtml(item.hostName || item.hostId || 'Local')} · ${escapeHtml(projectAvailability(item))}${escapeHtml(identity)}</span><span class="project-picker__path">${escapeHtml(item.path)}</span></button>`;
+      const identity = (identities.get(key) || 0) > 1 ? `${t(" · Workspace ID: ", " · 工作区 ID：")}${item.workspaceId || item.id}` : '';
+      return `<button type="button" class="project-picker__option" data-action="choose-project" data-id="${escapeHtml(item.id)}" aria-current="${item.id === projectId ? 'true' : 'false'}"${inScope(item, scope) ? '' : ' disabled'}><span class="project-picker__option-title">${escapeHtml(projectBasename(item))}${item.current ? ` <span class="project-picker__current">${t("Current workspace", "当前工作区")}</span>` : ''}</span><span class="project-picker__meta">${escapeHtml(item.workspaceId ? t('Workspace: {name}', '工作区：{name}', { name: item.name }) : t("Additional project path", "附加路径"))} · ${escapeHtml(item.hostName || item.hostId || t("Local", "本机"))} · ${escapeHtml(projectAvailability(item))}${escapeHtml(identity)}</span><span class="project-picker__path">${escapeHtml(item.path)}</span></button>`;
     }).join('');
-    return `<div class="project-picker"><button class="project-picker__trigger" type="button" data-action="toggle-project-picker" data-focus="project-picker" aria-label="${escapeHtml(project ? `Choose project, selected ${projectBasename(project)}, ${project.workspaceId ? `workspace ${project.name}` : 'additional path'}, ${project.hostName || project.hostId || 'Local'}, ${project.path}` : 'Choose project')}"${project ? ` title="${escapeHtml(project.path)}"` : ''} aria-expanded="${pressed(projectPickerOpen)}" aria-controls="project-picker-options"${pending || !projects.length ? ' disabled' : ''}><span class="project-picker__trigger-text"><strong>${escapeHtml(project ? projectBasename(project) : loadingProjects ? 'Loading projects…' : 'No project')}</strong><span>${escapeHtml(project ? `${project.workspaceId ? `Workspace: ${project.name}` : 'Additional path'} · ${projectAvailability(project)}` : 'Choose a workspace')}</span></span>${icon('arrow_drop_down')}</button><div id="project-picker-options" class="project-picker__panel" aria-label="Available projects"${projectPickerOpen ? '' : ' hidden'}><div class="project-picker__heading">Projects <span>Workspace · host · path</span></div>${scope ? '<p class="project-picker__scope">Saved filter scope limits project choices. Clear filters to see all projects.</p>' : ''}<div class="project-picker__list">${choices}</div></div></div>`;
+    return `<div class="project-picker"><button class="project-picker__trigger" type="button" data-action="toggle-project-picker" data-focus="project-picker" aria-label="${escapeHtml(project ? `${t("Choose project, selected ", "已选项目 ")}${projectBasename(project)}, ${project.workspaceId ? t('workspace {name}', '工作区 {name}', { name: project.name }) : t("additional path", "附加路径")}, ${project.hostName || project.hostId || t("Local", "本机")}, ${project.path}` : t("Choose project", "选择项目"))}"${project ? ` title="${escapeHtml(project.path)}"` : ''} aria-expanded="${pressed(projectPickerOpen)}" aria-controls="project-picker-options"${pending || !projects.length ? ' disabled' : ''}><span class="project-picker__trigger-text"><strong>${escapeHtml(project ? projectBasename(project) : loadingProjects ? t("Loading projects…", "正在加载项目…") : t("No project", "没有项目"))}</strong><span>${escapeHtml(project ? `${project.workspaceId ? t('Workspace: {name}', '工作区：{name}', { name: project.name }) : t("Additional path", "附加路径")} · ${projectAvailability(project)}` : t("Choose a workspace", "选择工作区"))}</span></span>${icon('arrow_drop_down')}</button><div id="project-picker-options" class="project-picker__panel" aria-label="${t("Available projects", "可选项目")}"${projectPickerOpen ? '' : ' hidden'}><div class="project-picker__heading">${t("Projects", "项目")} <span>${t("Workspace · host · path", "工作区 · 主机 · 路径")}</span></div>${scope ? `<p class="project-picker__scope">${t("Saved filter scope limits project choices. Clear filters to see all projects.", "已保存的筛选范围限制了可选项目。清除筛选以查看全部项目。")}</p>` : ''}<div class="project-picker__list">${choices}</div></div></div>`;
   }
 
   function searchField(): string {
-    return `<label class="search">${icon('search')}<span class="visually-hidden">Search issues</span><input data-input="search" data-focus="search" type="search" aria-label="Search issues" placeholder="Search by title, ID or label" value="${escapeHtml(query)}" autocomplete="off"><kbd>/</kbd></label>`;
+    return `<label class="search">${icon('search')}<span class="visually-hidden">${t("Search issues", "搜索议题")}</span><input data-input="search" data-focus="search" type="search" aria-label="${t("Search issues", "搜索议题")}" placeholder="${t("Search by title, ID or label", "按标题、ID 或标签搜索")}" value="${escapeHtml(query)}" autocomplete="off"><kbd>/</kbd></label>`;
   }
 
   function errorBanner(): string {
     const reason = loadError || snapshot?.project.availabilityReason || '';
-    const stale = snapshot && offline() ? `<div class="banner banner--state" role="status"><div><strong>Showing stale, read-only data</strong><p>Last fetched ${escapeHtml(snapshot.fetchedAt)}. Refresh to reconnect before changing issues or sending work.</p>${reason ? `<details data-persist="load-details"><summary data-focus="load-details">Technical details</summary><p>${escapeHtml(reason)}</p></details>` : ''}</div><button class="btn btn--outlined btn--sm" data-action="retry" type="button"${pending || loadingSnapshot || loadingProjects ? ' disabled' : ''}>Retry loading</button></div>` : '';
-    const error = actionError && !createOpen ? `<div class="banner" role="alert">${icon('error')}<div><strong>Could not complete the action</strong><p>${escapeHtml(actionError)}</p></div><button class="btn btn--icon" data-action="dismiss-error" type="button" aria-label="Dismiss error">${icon('close')}</button></div>` : '';
-    const undo = undoClose && undoClose.project === projectId ? `<div class="banner banner--undo" role="status"><div><strong>Closed ${escapeHtml(undoClose.id)}</strong><p>Undo reopens this issue if it has not changed.</p></div><button class="btn btn--outlined btn--sm" type="button" data-action="undo-close" title="${escapeHtml(actionCommand('reopen', undoClose.id))}"${disabled()}>Undo</button><button class="btn btn--icon" type="button" data-action="dismiss-undo" aria-label="Dismiss close message">${icon('close')}</button></div>` : '';
-    const cacheNotice = snapshot?.project.cacheError && !offline() ? `<div class="banner" role="status"><div><strong>Offline cache unavailable</strong><p>${escapeHtml(snapshot.project.cacheError)} The current snapshot is live but may not be available offline.</p></div></div>` : '';
-    return stale + cacheNotice + error + undo;
+    const stale = snapshot && offline() ? `<div class="banner banner--state" role="status"><div><strong>${t("Showing stale, read-only data", "正在显示过期的只读数据")}</strong><p>${t("Last fetched ", "上次获取 ")}${escapeHtml(snapshot.fetchedAt)}${t(". Refresh to reconnect before changing issues or sending work.", "。改议题或派活前先刷新重连。")}</p>${reason ? `<details data-persist="load-details"><summary data-focus="load-details">${t("Technical details", "技术细节")}</summary><p>${escapeHtml(reason)}</p></details>` : ''}</div><button class="btn btn--outlined btn--sm" data-action="retry" type="button"${pending || loadingSnapshot || loadingProjects ? ' disabled' : ''}>${t("Retry loading", "重新加载")}</button></div>` : '';
+    const error = actionError && !createOpen ? `<div class="banner" role="alert">${icon('error')}<div><strong>${t("Could not complete the action", "操作没有完成")}</strong><p>${escapeHtml(actionError)}</p></div><button class="btn btn--icon" data-action="dismiss-error" type="button" aria-label="${t("Dismiss error", "关闭错误")}">${icon('close')}</button></div>` : '';
+    const undo = undoClose && undoClose.project === projectId ? `<div class="banner banner--undo" role="status"><div><strong>${t('Closed {id}', '已关闭 {id}', { id: escapeHtml(undoClose.id) })}</strong><p>${t("Undo reopens this issue if it has not changed.", "如果议题没有变化，撤销会重新打开它。")}</p></div><button class="btn btn--outlined btn--sm" type="button" data-action="undo-close" title="${escapeHtml(actionCommand('reopen', undoClose.id))}"${disabled()}>${t("Undo", "撤销")}</button><button class="btn btn--icon" type="button" data-action="dismiss-undo" aria-label="${t("Dismiss close message", "关闭这条关闭提示")}">${icon('close')}</button></div>` : '';
+    const cacheNotice = snapshot?.project.cacheError && !offline() ? `<div class="banner" role="status"><div><strong>${t("Offline cache unavailable", "离线缓存不可用")}</strong><p>${escapeHtml(snapshot.project.cacheError)} The current snapshot is live but may not be available offline.</p></div></div>` : '';
+    const paths = pathErrors.length ? `<div class="banner" role="status"><div><strong>${t("Some additional project paths were skipped", "有些附加项目路径被跳过了")}</strong><pre class="command">${escapeHtml(pathErrors.join('\n'))}</pre></div></div>` : '';
+    return stale + cacheNotice + paths + error + undo;
   }
 
   function createButton(): string {
-    return `<button type="button" class="btn btn--primary" data-action="new" aria-label="New issue"${disabled()}${projectId ? '' : ' disabled'}>${icon('add')}<span>New issue</span><kbd>N</kbd></button>`;
+    return `<button type="button" class="btn btn--primary" data-action="new" aria-label="${t("New issue", "新建议题")}"${disabled()}${projectId ? '' : ' disabled'}>${icon('add')}<span>${t("New issue", "新建议题")}</span><kbd>N</kbd></button>`;
   }
 
   function card(issue: Issue): string {
     const group = groupOf(issue);
     const dependencyBlocked = blockedIds.has(issue.id);
-    return `<article class="issue-card${selectedId === issue.id ? ' issue-card--selected' : ''}${group === 'closed' ? ' issue-card--closed' : ''}" draggable="${pressed(!pending && !offline())}" data-action="select" data-id="${escapeHtml(issue.id)}" title="Drag to move, or open for keyboard-accessible actions">
-      <span class="issue-card__top"><input type="checkbox" data-change="pool" data-id="${escapeHtml(issue.id)}" aria-label="Select ${escapeHtml(issue.id)} for handoff"${taskPool.has(`${projectId}\0${issue.id}`) ? ' checked' : ''}>${icon(typeIcons[issue.type] ?? 'task_alt')}<span class="mono">${escapeHtml(issue.id)}</span>${priority(issue)}</span>
+    return `<article class="issue-card${selectedId === issue.id ? ' issue-card--selected' : ''}${group === 'closed' ? ' issue-card--closed' : ''}" draggable="${pressed(!pending && !offline())}" data-action="select" data-id="${escapeHtml(issue.id)}" title="${t("Drag to move, or open for keyboard-accessible actions", "拖动以移动，或打开后用键盘操作")}">
+      <span class="issue-card__top"><input type="checkbox" data-change="pool" data-id="${escapeHtml(issue.id)}" aria-label="${t('Select {id} for handoff', '把 {id} 选入交接', { id: escapeHtml(issue.id) })}"${taskPool.has(`${projectId}\0${issue.id}`) ? ' checked' : ''}>${icon(typeIcons[issue.type] ?? 'task_alt')}<span class="mono">${escapeHtml(issue.id)}</span>${priority(issue)}</span>
       <span class="issue-card__relation" hidden></span>
-      <button type="button" class="text-link issue-card__title" data-action="select" data-id="${escapeHtml(issue.id)}" aria-label="Open ${escapeHtml(issue.id)}: ${escapeHtml(issue.title)}">${escapeHtml(issue.title)}</button>
-      ${dependencyBlocked ? `<span class="issue-card__blockers">${icon('lock')}<span>Blocked by dependencies</span></span>` : ''}
-      ${issue.dependencies.length ? `<span class="issue-card__footer">Relationships: ${escapeHtml(relationships(issue))}</span>` : ''}
-      <span class="issue-card__footer"><span>${escapeHtml(issue.type)}</span>${issue.assignee ? `<span>${escapeHtml(issue.assignee)}</span>` : '<span>Unassigned</span>'}</span>
+      <button type="button" class="text-link issue-card__title" data-action="select" data-id="${escapeHtml(issue.id)}" aria-label="${t('Open {id}: {title}', '打开 {id}：{title}', { id: escapeHtml(issue.id), title: escapeHtml(issue.title) })}">${escapeHtml(issue.title)}</button>
+      ${dependencyBlocked ? `<span class="issue-card__blockers">${icon('lock')}<span>${t("Blocked by dependencies", "被依赖阻塞")}</span></span>` : ''}
+      ${issue.dependencies.length ? `<span class="issue-card__footer">${t("Relationships", "关系")}: ${escapeHtml(relationships(issue))}</span>` : ''}
+      <span class="issue-card__footer"><span>${escapeHtml(typeLabel(issue.type))}</span>${issue.assignee ? `<span>${escapeHtml(issue.assignee)}</span>` : `<span>${t("Unassigned", "未指派")}</span>`}</span>
       ${issue.labels.length ? `<span class="issue-card__labels">${issue.labels.map((label) => `<span class="chip chip--label">${escapeHtml(label)}</span>`).join('')}</span>` : ''}
     </article>`;
   }
@@ -297,8 +317,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
   }
   function tableContent(issues: Issue[]): string {
     const headers: Array<[SortKey, string]> = [
-      ['title', 'Title'], ['status', 'Status'], ['priority', 'Priority'], ['epic', 'Epic'],
-      ['assignee', 'Assignee'], ['type', 'Type'], ['relationships', 'Relationships'], ['labels', 'Labels'], ['updated', 'Updated'],
+      ['title', t("Title", "标题")], ['status', t("Status", "状态")], ['priority', t("Priority", "优先级")], ['epic', t("Epic", "需求")],
+      ['assignee', t("Assignee", "负责人")], ['type', t("Type", "类型")], ['relationships', t("Relationships", "关系")], ['labels', t("Labels", "标签")], ['updated', t("Updated", "更新")],
     ];
     const value = (issue: Issue): string | number => {
       switch (sortKey) {
@@ -317,12 +337,12 @@ export function mount(root: HTMLElement, transport: Transport): void {
       return (sortDirection === 'ascending' ? order : -order) || a.priority - b.priority || a.id.localeCompare(b.id);
     });
     registerWindow('table', sorted, 64, true);
-    return `<div class="table-wrap" data-window-container="table" role="region" aria-label="Issue table" tabindex="0"><table class="issue-table" aria-rowcount="${sorted.length + 1}"><thead><tr><th scope="col"><span class="visually-hidden">Select for handoff</span></th>${headers.map(([key, label]) => `<th scope="col" aria-sort="${key === sortKey || (key === 'title' && sortKey === 'id') ? sortDirection : 'none'}"><button class="table-sort" type="button" data-action="sort" data-value="${key}">${label}${key === sortKey ? `<span class="table-sort__arrow${sortDirection === 'ascending' ? ' table-sort__arrow--up' : ''}">${icon('arrow_drop_down')}</span>` : ''}</button>${key === 'title' ? ` <button class="table-sort table-sort--id" type="button" data-action="sort" data-value="id" aria-label="Sort by issue ID">ID${sortKey === 'id' ? `<span class="table-sort__arrow${sortDirection === 'ascending' ? ' table-sort__arrow--up' : ''}">${icon('arrow_drop_down')}</span>` : ''}</button>` : ''}</th>`).join('')}</tr></thead><tbody data-window-content="table"></tbody></table></div>`;
+    return `<div class="table-wrap" data-window-container="table" role="region" aria-label="${t("Issue table", "议题表格")}" tabindex="0"><table class="issue-table" aria-rowcount="${sorted.length + 1}"><thead><tr><th scope="col"><span class="visually-hidden">${t("Select for handoff", "选择以交接")}</span></th>${headers.map(([key, label]) => `<th scope="col" aria-sort="${key === sortKey || (key === 'title' && sortKey === 'id') ? sortDirection : 'none'}"><button class="table-sort" type="button" data-action="sort" data-value="${key}">${label}${key === sortKey ? `<span class="table-sort__arrow${sortDirection === 'ascending' ? ' table-sort__arrow--up' : ''}">${icon('arrow_drop_down')}</span>` : ''}</button>${key === 'title' ? ` <button class="table-sort table-sort--id" type="button" data-action="sort" data-value="id" aria-label="${t("Sort by issue ID", "按 ID 排序")}">ID${sortKey === 'id' ? `<span class="table-sort__arrow${sortDirection === 'ascending' ? ' table-sort__arrow--up' : ''}">${icon('arrow_drop_down')}</span>` : ''}</button>` : ''}</th>`).join('')}</tr></thead><tbody data-window-content="table"></tbody></table></div>`;
   }
   function tableRow(issue: Issue): string {
     const group = groupOf(issue);
     const epic = model?.epicFor(issue);
-    return `<tr class="issue-table__row" data-id="${escapeHtml(issue.id)}" data-selected="${pressed(issue.id === selectedId)}"><td><input type="checkbox" data-change="pool" data-id="${escapeHtml(issue.id)}" aria-label="Select ${escapeHtml(issue.id)} for handoff"${taskPool.has(`${projectId}\0${issue.id}`) ? ' checked' : ''}></td><td><button class="table-link" type="button" data-action="select" data-id="${escapeHtml(issue.id)}" aria-label="Open ${escapeHtml(issue.id)}: ${escapeHtml(issue.title)}">${escapeHtml(issue.title)}</button><span class="mono issue-table__id">${escapeHtml(issue.id)}${issue.type === 'epic' ? ' · Epic' : ''}</span><span class="issue-table__relation" hidden></span></td><td>${bead(group)} ${escapeHtml(groupNames[group])}</td><td>${priority(issue)}</td><td>${escapeHtml(epic?.title || '—')}</td><td>${escapeHtml(issue.assignee || 'Unassigned')}</td><td>${escapeHtml(issue.type)}</td><td>${escapeHtml(relationships(issue) || '—')}</td><td>${issue.labels.map((label) => `<span class="chip chip--label">${escapeHtml(label)}</span>`).join(' ') || '—'}</td><td>${escapeHtml(relativeTime(issue.updatedAt))}</td></tr>`;
+    return `<tr class="issue-table__row" data-id="${escapeHtml(issue.id)}" data-selected="${pressed(issue.id === selectedId)}"><td><input type="checkbox" data-change="pool" data-id="${escapeHtml(issue.id)}" aria-label="${t('Select {id} for handoff', '把 {id} 选入交接', { id: escapeHtml(issue.id) })}"${taskPool.has(`${projectId}\0${issue.id}`) ? ' checked' : ''}></td><td><button class="table-link" type="button" data-action="select" data-id="${escapeHtml(issue.id)}" aria-label="${t('Open {id}: {title}', '打开 {id}：{title}', { id: escapeHtml(issue.id), title: escapeHtml(issue.title) })}">${escapeHtml(issue.title)}</button><span class="mono issue-table__id">${escapeHtml(issue.id)}${issue.type === 'epic' ? ` · ${typeLabel('epic')}` : ''}</span><span class="issue-table__relation" hidden></span></td><td>${bead(group)} ${escapeHtml(groupLabel(group))}</td><td>${priority(issue)}</td><td>${escapeHtml(epic?.title || '—')}</td><td>${escapeHtml(issue.assignee || t("Unassigned", "未指派"))}</td><td>${escapeHtml(typeLabel(issue.type))}</td><td>${escapeHtml(relationships(issue) || '—')}</td><td>${issue.labels.map((label) => `<span class="chip chip--label">${escapeHtml(label)}</span>`).join(' ') || '—'}</td><td>${escapeHtml(relativeTime(issue.updatedAt))}</td></tr>`;
   }
 
   function syncWindow(key: string): void {
@@ -422,10 +442,10 @@ export function mount(root: HTMLElement, transport: Transport): void {
     let geometryChanged = false;
     if (issue && spotlightOn) {
       for (const dep of issue.dependencies) {
-        relations.set(dep.id, dep.type === 'blocks' ? 'Dependency · blocks' : dep.type === 'discovered-from' ? 'Found in' : dep.type);
+        relations.set(dep.id, dep.type === 'blocks' ? t('Dependency · blocks', '依赖 · 阻塞') : dep.type === 'discovered-from' ? t('Found in', '发现自') : relationLabel(dep.type));
       }
       for (const reference of model?.references.get(id) || []) {
-        if (!relations.has(reference.issue.id)) relations.set(reference.issue.id, reference.type === 'blocks' ? 'Depends on this · blocks' : reference.type);
+        if (!relations.has(reference.issue.id)) relations.set(reference.issue.id, reference.type === 'blocks' ? t('Depends on this · blocks', '被这条阻塞') : relationLabel(reference.type));
       }
     }
     for (const element of root.querySelectorAll<HTMLElement>('.issue-card, .issue-table__row')) {
@@ -446,16 +466,16 @@ export function mount(root: HTMLElement, transport: Transport): void {
 
   function boardContent(): string {
     const issues = filtered();
-    if (!allIssues().length) return `<div class="empty-state"><h2>No issues yet</h2><p>${offline() ? 'This saved snapshot contains no issues.' : 'Create the first issue in this project to start the board.'}</p>${offline() ? '' : createButton()}</div>`;
+    if (!allIssues().length) return `<div class="empty-state"><h2>${t("No issues yet", "还没有议题")}</h2><p>${offline() ? t("This saved snapshot contains no issues.", "这份保存的快照里没有议题。") : t("Create the first issue in this project to start the board.", "在这个项目里创建第一条议题，看板就会开始。")}</p>${offline() ? '' : createButton()}</div>`;
     if (!issues.length) {
       const narrowed = !!(query.trim() || typeFilter || priorityFilter || assigneeFilter || epicFilter);
-      return `<div class="empty-state empty-state--no-results" role="status"><div class="empty-state__content"><span class="empty-state__icon">${icon('search')}</span><h2>${narrowed ? 'No issues match these filters' : view === 'all' ? 'No open issues' : `No ${escapeHtml(groupNames[view].toLocaleLowerCase())} issues`}</h2><p>${narrowed ? 'Try a different search or reset the task filters to see more issues.' : view === 'all' ? 'This project only has closed issues. Show all issues to include them.' : 'There are no issues in this view. Choose another status or return to All issues.'}</p><div class="empty-state__actions">${narrowed ? '<button class="btn btn--primary" data-action="clear-filters" type="button">Reset task filters</button>' : ''}${!narrowed || view !== 'all' ? `<button class="btn ${narrowed ? 'btn--outlined' : 'btn--primary'}" data-action="show-all-issues" type="button">Show all issues</button>` : ''}</div></div></div>`;
+      return `<div class="empty-state empty-state--no-results" role="status"><div class="empty-state__content"><span class="empty-state__icon">${icon('search')}</span><h2>${narrowed ? t("No issues match these filters", "没有议题匹配这些筛选") : view === 'all' ? t("No open issues", "没有未关闭的议题") : t('No {group} issues', '没有{group}议题', { group: groupLabel(view) })}</h2><p>${narrowed ? t("Try a different search or reset the task filters to see more issues.", "换个搜索，或重置议题筛选。") : view === 'all' ? t("This project only has closed issues. Show all issues to include them.", "这个项目只剩下已关闭议题。显示全部议题即可看到它们。") : t("There are no issues in this view. Choose another status or return to All issues.", "这个视图里没有议题。换个状态，或回到全部议题。")}</p><div class="empty-state__actions">${narrowed ? `<button class="btn btn--primary" data-action="clear-filters" type="button">${t("Reset task filters", "重置议题筛选")}</button>` : ''}${!narrowed || view !== 'all' ? `<button class="btn ${narrowed ? 'btn--outlined' : 'btn--primary'}" data-action="show-all-issues" type="button">${t("Show all issues", "显示全部议题")}</button>` : ''}</div></div></div>`;
     }
     if (view !== 'all' || layout === 'table') return tableContent(issues);
-    return `<div class="board" aria-label="Issues by status">${groupOrder.filter((group) => (group !== 'other' || issues.some((issue) => groupOf(issue) === group)) && (showClosed || group !== 'closed')).map((group) => {
+    return `<div class="board" aria-label="${t("Issues by status", "按状态排列的议题")}">${groupOrder.filter((group) => (group !== 'other' || issues.some((issue) => groupOf(issue) === group)) && (showClosed || group !== 'closed')).map((group) => {
       const items = issues.filter((issue) => groupOf(issue) === group);
       registerWindow(group, items, 180, false);
-      return `<section class="column" data-drop-group="${group}" aria-label="${escapeHtml(groupNames[group])}"><h2 class="column__header">${bead(group)}<span>${escapeHtml(groupNames[group])}</span><span class="column__count">${items.length}</span></h2><p class="column__drop-hint" hidden></p><div class="column__list" data-window-container="${group}" data-window-content="${group}" tabindex="0" aria-label="${escapeHtml(groupNames[group])} issues">${items.length ? '' : '<p class="column__empty">No issues</p>'}</div></section>`;
+      return `<section class="column" data-drop-group="${group}" aria-label="${escapeHtml(groupLabel(group))}"><h2 class="column__header">${bead(group)}<span>${escapeHtml(groupLabel(group))}</span><span class="column__count">${items.length}</span></h2><p class="column__drop-hint" hidden></p><div class="column__list" data-window-container="${group}" data-window-content="${group}" tabindex="0" aria-label="${escapeHtml(groupLabel(group))}${t(" issues", "议题")}">${items.length ? '' : `<p class="column__empty">${t("No issues", "没有议题")}</p>`}</div></section>`;
     }).join('')}</div>`;
   }
 
@@ -464,7 +484,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const assignees = [...new Set(allIssues().map((issue) => issue.assignee).filter(Boolean))].sort();
     const activeFilters = Number(!!typeFilter) + Number(!!priorityFilter) + Number(!!assigneeFilter) + Number(!!epicFilter)
       + Number(!!(scope?.projectNames.length || scope?.hostNames.length));
-    return `<div class="filters${filtersExpanded ? ' filters--expanded' : ''}"><button type="button" class="btn btn--outlined btn--sm filters__toggle" data-action="toggle-filters" aria-expanded="${pressed(filtersExpanded)}" aria-controls="issue-filters">Filters${activeFilters ? ` (${activeFilters})` : ''}${icon('arrow_drop_down')}</button><div id="issue-filters" class="filter-bar${filtersExpanded ? ' filter-bar--expanded' : ''}" aria-label="Filters"><label><span class="visually-hidden">Type</span><select data-change="type" data-focus="type" aria-label="Filter by type"><option value="">All types</option>${issueTypes.map((type) => `<option value="${escapeHtml(type)}"${selected(typeFilter, type)}>${escapeHtml(type)}</option>`).join('')}</select></label><label><span class="visually-hidden">Priority</span><select data-change="priority" data-focus="priority" aria-label="Filter by priority"><option value="">All priorities</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(priorityFilter, String(value))}>P${value}</option>`).join('')}</select></label><label><span class="visually-hidden">Assignee</span><select data-change="assignee" data-focus="assignee" aria-label="Filter by assignee"><option value="">All assignees</option>${assignees.map((assignee) => `<option value="${escapeHtml(assignee)}"${selected(assigneeFilter, assignee)}>${escapeHtml(assignee)}</option>`).join('')}</select></label>${view === 'all' ? `<label class="check"><input type="checkbox" data-change="closed"${showClosed ? ' checked' : ''}> Include closed</label>` : view === 'closed' ? '<span class="muted">Closed issues are always visible here</span>' : ''}<button class="btn btn--text btn--sm" type="button" data-action="clear-filters">Clear filters</button><span class="filter-bar__spacer"></span><span class="muted">${snapshot ? `${filtered().length} shown` : 'Issues not loaded'}${taskPool.size ? ` · ${taskPool.size} selected${hiddenSelection ? ` · ${hiddenSelection} hidden by filters or project` : ''}` : ''}</span>${taskPool.size ? '<button class="btn btn--text btn--sm" type="button" data-action="clear-pool">Clear selection</button>' : ''}</div></div>`;
+    return `<div class="filters${filtersExpanded ? ' filters--expanded' : ''}"><button type="button" class="btn btn--outlined btn--sm filters__toggle" data-action="toggle-filters" aria-expanded="${pressed(filtersExpanded)}" aria-controls="issue-filters">${t("Filters", "筛选")}${activeFilters ? ` (${activeFilters})` : ''}${icon('arrow_drop_down')}</button><div id="issue-filters" class="filter-bar${filtersExpanded ? ' filter-bar--expanded' : ''}" aria-label="${t("Filters", "筛选")}"><label><span class="visually-hidden">${t("Type", "类型")}</span><select data-change="type" data-focus="type" aria-label="${t("Filter by type", "按类型筛选")}"><option value="">${t("All types", "全部类型")}</option>${issueTypes.map((type) => `<option value="${escapeHtml(type)}"${selected(typeFilter, type)}>${escapeHtml(typeLabel(type))}</option>`).join('')}</select></label><label><span class="visually-hidden">${t("Priority", "优先级")}</span><select data-change="priority" data-focus="priority" aria-label="${t("Filter by priority", "按优先级")}"><option value="">${t("All priorities", "全部优先级")}</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(priorityFilter, String(value))}>P${value}</option>`).join('')}</select></label><label><span class="visually-hidden">${t("Assignee", "负责人")}</span><select data-change="assignee" data-focus="assignee" aria-label="${t("Filter by assignee", "按负责人")}"><option value="">${t("All assignees", "全部负责人")}</option>${assignees.map((assignee) => `<option value="${escapeHtml(assignee)}"${selected(assigneeFilter, assignee)}>${escapeHtml(assignee)}</option>`).join('')}</select></label>${view === 'all' ? `<label class="check"><input type="checkbox" data-change="closed"${showClosed ? ' checked' : ''}> ${t("Include closed", "含已关闭")}</label>` : view === 'closed' ? `<span class="muted">${t("Closed issues are always visible here", "这里始终显示已关闭议题")}</span>` : ''}<button class="btn btn--text btn--sm" type="button" data-action="clear-filters">${t("Clear filters", "清除筛选")}</button><span class="filter-bar__spacer"></span><span class="muted">${snapshot ? `${filtered().length}${t(" shown", " 条")}` : t('Issues not loaded', '议题还没加载')}${taskPool.size ? ` · ${taskPool.size}${t(" selected", " 已选")}${hiddenSelection ? ` · ${hiddenSelection}${t(" hidden by filters or project", " 被筛选或项目挡住")}` : ''}` : ''}</span>${taskPool.size ? `<button class="btn btn--text btn--sm" type="button" data-action="clear-pool">${t("Clear selection", "清除选择")}</button>` : ''}</div></div>`;
   }
 
   function resetEpicListFilters(): void {
@@ -488,35 +508,35 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const options = selectedEpic && !shown.includes(selectedEpic) ? [selectedEpic, ...shown] : shown;
     const active = Number(!!epicStatus) + Number(!!epicPriority) + Number(!!epicAssignee);
     const assignees = [...new Set(epics.map((epic) => epic.assignee).filter(Boolean))].sort();
-    const statusLabels: Record<string, string> = { open: 'Open', in_progress: 'In progress', blocked: 'Blocked', deferred: 'Deferred', closed: 'Closed' };
-    const statuses = [...new Set([...Object.keys(statusLabels), ...epics.map((epic) => epic.status)])];
-    const epicOptions = `<option value="all"${selected(epicValue, 'all')}>All epics</option><option value="none"${selected(epicValue, 'none')}>No epic</option>${options.map((epic) => `<option value="id:${escapeHtml(epic.id)}"${selected(epicValue, `id:${epic.id}`)}>${escapeHtml(epic.title)} · ${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? ' (outside filters)' : ''}</option>`).join('')}`;
-    return `<nav class="rail" aria-label="Workspace">
+    const knownStatuses = ['open', 'in_progress', 'blocked', 'deferred', 'closed'];
+    const statuses = [...new Set([...knownStatuses, ...epics.map((epic) => epic.status)])];
+    const epicOptions = `<option value="all"${selected(epicValue, 'all')}>${t("All epics", "全部需求")}</option><option value="none"${selected(epicValue, 'none')}>${t("No epic", "无需求")}</option>${options.map((epic) => `<option value="id:${escapeHtml(epic.id)}"${selected(epicValue, `id:${epic.id}`)}>${escapeHtml(epic.title)} · ${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? t(" (outside filters)", "（不在筛选里）") : ''}</option>`).join('')}`;
+    return `<nav class="rail" aria-label="${t("Workspace", "工作区")}">
       <div class="rail__workspace"><span class="rail__glyph">${escapeHtml((project ? projectBasename(project) : 'B').slice(0, 2).toLocaleLowerCase())}</span><div>${projectSelect()}</div></div>
       <div class="rail__create">${createButton()}</div>
-      <label class="rail__view"><span class="visually-hidden">Issue view</span><select data-change="view" data-focus="view" aria-label="Issue view">${groups.map((group) => `<option value="${group}"${selected(view, group)}>${group === 'all' ? 'All issues' : escapeHtml(groupNames[group])}</option>`).join('')}</select></label>
-      <h2 class="rail__heading">Views</h2>
-      ${groups.map((group) => `<button type="button" class="rail__item" data-action="view" data-value="${group}" aria-current="${pressed(view === group)}">${group === 'all' ? icon('view_kanban') : bead(group)}<span>${group === 'all' ? 'All issues' : escapeHtml(groupNames[group])}</span><span class="rail__count">${snapshot ? count(group) : '—'}</span></button>`).join('')}
-      <section class="rail__epics" aria-label="Epics">
-        <div class="rail__epic-heading"><h2>Epics</h2><button class="btn btn--text btn--sm" type="button" data-action="toggle-epic-filters" data-focus="toggle-epic-filters" aria-label="Filter epic list${active ? `, ${active} active` : ''}" aria-expanded="${pressed(epicFiltersExpanded)}" aria-controls="epic-list-filters">Filters${active ? ` · ${active}` : ''}${icon('arrow_drop_down')}</button></div>
+      <label class="rail__view"><span class="visually-hidden">${t("Issue view", "议题视图")}</span><select data-change="view" data-focus="view" aria-label="${t("Issue view", "议题视图")}">${groups.map((group) => `<option value="${group}"${selected(view, group)}>${group === 'all' ? t("All issues", "全部议题") : escapeHtml(groupLabel(group))}</option>`).join('')}</select></label>
+      <h2 class="rail__heading">${t("Views", "视图")}</h2>
+      ${groups.map((group) => `<button type="button" class="rail__item" data-action="view" data-value="${group}" aria-current="${pressed(view === group)}">${group === 'all' ? icon('view_kanban') : bead(group)}<span>${group === 'all' ? t("All issues", "全部议题") : escapeHtml(groupLabel(group))}</span><span class="rail__count">${snapshot ? count(group) : '—'}</span></button>`).join('')}
+      <section class="rail__epics" aria-label="${t("Epics", "需求")}">
+        <div class="rail__epic-heading"><h2>${t("Epics", "需求")}</h2><button class="btn btn--text btn--sm" type="button" data-action="toggle-epic-filters" data-focus="toggle-epic-filters" aria-label="${t("Filter epic list", "筛选需求列表")}${active ? `, ${active}${t(" active", " 项")}` : ''}" aria-expanded="${pressed(epicFiltersExpanded)}" aria-controls="epic-list-filters">${t("Filters", "筛选")}${active ? ` · ${active}` : ''}${icon('arrow_drop_down')}</button></div>
         <div class="rail__epic-controls">
-          <label class="rail__epic-search"><span class="visually-hidden">Search epics</span><input type="search" data-input="epic-search" data-focus="epic-search" placeholder="Search epics" aria-label="Search epics" value="${escapeHtml(epicSearch)}"></label>
-          <label class="rail__epic-picker"><span class="visually-hidden">Epic</span><select data-change="epic" data-focus="epic-mobile" aria-label="Epic">${epicOptions}</select></label>
+          <label class="rail__epic-search"><span class="visually-hidden">${t("Search epics", "搜索需求")}</span><input type="search" data-input="epic-search" data-focus="epic-search" placeholder="${t("Search epics", "搜索需求")}" aria-label="${t("Search epics", "搜索需求")}" value="${escapeHtml(epicSearch)}"></label>
+          <label class="rail__epic-picker"><span class="visually-hidden">${t("Epic", "需求")}</span><select data-change="epic" data-focus="epic-mobile" aria-label="${t("Epic", "需求")}">${epicOptions}</select></label>
         </div>
         <div class="epic-filters" id="epic-list-filters"${epicFiltersExpanded ? '' : ' hidden'}>
-          <label>Status<select data-change="epic-status" data-focus="epic-status" aria-label="Epic status"><option value="">All statuses</option>${statuses.map((status) => `<option value="${escapeHtml(status)}"${selected(epicStatus, status)}>${escapeHtml(statusLabels[status] || status)}</option>`).join('')}</select></label>
-          <label>Priority<select data-change="epic-priority" data-focus="epic-priority" aria-label="Epic priority"><option value="">All priorities</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(epicPriority, String(value))}>P${value}</option>`).join('')}</select></label>
-          <label>Assignee<select data-change="epic-assignee" data-focus="epic-assignee" aria-label="Epic assignee"><option value="">All assignees</option><option value="unassigned"${selected(epicAssignee, 'unassigned')}>Unassigned</option>${assignees.map((name) => `<option value="${escapeHtml(`name:${name}`)}"${selected(epicAssignee, `name:${name}`)}>${escapeHtml(name)}</option>`).join('')}</select></label>
-          <p>Only filters the epic list, not its tasks.</p>
+          <label>${t("Status", "状态")}<select data-change="epic-status" data-focus="epic-status" aria-label="${t("Epic status", "需求状态")}"><option value="">${t("All statuses", "全部状态")}</option>${statuses.map((status) => `<option value="${escapeHtml(status)}"${selected(epicStatus, status)}>${escapeHtml(statusLabel(status))}</option>`).join('')}</select></label>
+          <label>${t("Priority", "优先级")}<select data-change="epic-priority" data-focus="epic-priority" aria-label="${t("Epic priority", "需求优先级")}"><option value="">${t("All priorities", "全部优先级")}</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(epicPriority, String(value))}>P${value}</option>`).join('')}</select></label>
+          <label>${t("Assignee", "负责人")}<select data-change="epic-assignee" data-focus="epic-assignee" aria-label="${t("Epic assignee", "需求负责人")}"><option value="">${t("All assignees", "全部负责人")}</option><option value="unassigned"${selected(epicAssignee, 'unassigned')}>${t("Unassigned", "未指派")}</option>${assignees.map((name) => `<option value="${escapeHtml(`name:${name}`)}"${selected(epicAssignee, `name:${name}`)}>${escapeHtml(name)}</option>`).join('')}</select></label>
+          <p>${t("Only filters the epic list, not its tasks.", "只筛选需求列表，不影响它下面的议题。")}</p>
         </div>
-        <div class="rail__epic-meta"><span role="status">${snapshot ? `${matches.length} of ${epics.length} epics` : 'Epics not loaded'}</span><button class="btn btn--text btn--sm" type="button" data-action="clear-epic-filters" data-focus="clear-epic-filters" aria-label="Reset epic list filters"${active || epicSearch ? '' : ' disabled'}>Reset</button></div>
-        ${selectedOutside ? '<p class="rail__epic-notice">Selected epic is outside these filters. Its tasks remain displayed.</p>' : ''}
+        <div class="rail__epic-meta"><span role="status">${snapshot ? t('{shown} of {total} epics', '{shown} / {total} 个需求', { shown: matches.length, total: epics.length }) : t("Epics not loaded", "需求还没加载")}</span><button class="btn btn--text btn--sm" type="button" data-action="clear-epic-filters" data-focus="clear-epic-filters" aria-label="${t("Reset epic list filters", "重置需求列表筛选")}"${active || epicSearch ? '' : ' disabled'}>${t("Reset", "重置")}</button></div>
+        ${selectedOutside ? `<p class="rail__epic-notice">${t("Selected epic is outside these filters. Its tasks remain displayed.", "选中的需求不在这些筛选里。它的议题仍会显示。")}</p>` : ''}
         <div class="rail__epic-list">
-          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="all" aria-current="${pressed(epicValue === 'all')}">${icon('account_tree')}<span>All epics</span></button>
-          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="none" aria-current="${pressed(epicValue === 'none')}">${icon('account_tree')}<span>No epic</span></button>
-          ${options.map((epic) => `<button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="id:${escapeHtml(epic.id)}" aria-current="${pressed(epicValue === `id:${epic.id}`)}" title="${escapeHtml(`${epic.title} · ${epic.id}`)}">${icon('account_tree')}<span>${escapeHtml(epic.title)} <small>${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? ' · outside filters' : ''}</small></span></button>`).join('')}
+          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="all" aria-current="${pressed(epicValue === 'all')}">${icon('account_tree')}<span>${t("All epics", "全部需求")}</span></button>
+          <button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="none" aria-current="${pressed(epicValue === 'none')}">${icon('account_tree')}<span>${t("No epic", "无需求")}</span></button>
+          ${options.map((epic) => `<button class="rail__item rail__item--epic" type="button" data-action="epic" data-value="id:${escapeHtml(epic.id)}" aria-current="${pressed(epicValue === `id:${epic.id}`)}" title="${escapeHtml(`${epic.title} · ${epic.id}`)}">${icon('account_tree')}<span>${escapeHtml(epic.title)} <small>${escapeHtml(epic.id)}${selectedOutside && epic === selectedEpic ? t(" · outside filters", " · 不在筛选里") : ''}</small></span></button>`).join('')}
         </div>
-        ${matches.length > shown.length ? `<p class="muted rail__epic-empty">${matches.length - shown.length} more; refine the search or filters.</p>` : snapshot && !shown.length ? '<p class="muted rail__epic-empty">No matching epics. Change the filters or reset them.</p>' : ''}
+        ${matches.length > shown.length ? `<p class="muted rail__epic-empty">${matches.length - shown.length}${t(" more; refine the search or filters.", " 条未显示，缩小搜索或筛选。")}</p>` : snapshot && !shown.length ? `<p class="muted rail__epic-empty">${t("No matching epics. Change the filters or reset them.", "没有对上的需求。改筛选或重置。")}</p>` : ''}
       </section>
     </nav>`;
   }
@@ -524,10 +544,10 @@ export function mount(root: HTMLElement, transport: Transport): void {
   function detailActions(issue: Issue): string {
     const group = groupOf(issue);
     const button = (method: string, label: string, glyph: string, primary: boolean): string => `<button type="button" class="btn ${primary ? 'btn--primary' : 'btn--secondary'}" data-action="${method}" data-id="${escapeHtml(issue.id)}" title="${escapeHtml(actionCommand(method, issue.id))}"${disabled()}>${icon(glyph)}${label}</button>`;
-    if (group === 'closed') return button('reopen', 'Reopen', 'undo', false);
-    const claim = group === 'ready' ? button('claim', 'Claim', 'play_arrow', true) : '';
-    const reclaim = issue.status === 'in_progress' && issue.heartbeatAt && Date.now() - Date.parse(issue.heartbeatAt) > 30 * 60_000 ? button('reclaim', 'Reclaim lease', 'hourglass_disabled', false) : '';
-    return `${claim}${reclaim}${button('close', 'Close', 'check', !claim && !reclaim)}`;
+    if (group === 'closed') return button('reopen', t("Reopen", "重新打开"), 'undo', false);
+    const claim = group === 'ready' ? button('claim', t("Claim", "认领"), 'play_arrow', true) : '';
+    const reclaim = issue.status === 'in_progress' && issue.heartbeatAt && Date.now() - Date.parse(issue.heartbeatAt) > 30 * 60_000 ? button('reclaim', t("Reclaim lease", "收回租约"), 'hourglass_disabled', false) : '';
+    return `${claim}${reclaim}${button('close', t("Close", "关闭"), 'check', !claim && !reclaim)}`;
   }
 
   function draftKey(id: string): string {
@@ -536,27 +556,27 @@ export function mount(root: HTMLElement, transport: Transport): void {
 
   function editSection(issue: Issue): string {
     const edit = editDrafts.get(draftKey(issue.id));
-    if (!edit) return `<button type="button" class="btn btn--outlined" data-action="edit" data-id="${escapeHtml(issue.id)}"${pending || detailLoading || detailError ? ' disabled' : ''}>Edit issue</button>`;
+    if (!edit) return `<button type="button" class="btn btn--outlined" data-action="edit" data-id="${escapeHtml(issue.id)}"${pending || detailLoading || detailError ? ' disabled' : ''}>${t("Edit issue", "编辑议题")}</button>`;
     const values = edit.values;
     const changes = changedFields(edit);
     const field = (name: keyof EditValues, label: string, multiline = false): string => `<label class="field">${label}${multiline
       ? `<textarea name="${name}" data-input="edit" rows="3"${disabled()}>${escapeHtml(values[name])}</textarea>`
       : `<input name="${name}" data-input="edit" value="${escapeHtml(values[name])}"${name === 'title' ? ' required' : ''}${disabled()}>`}</label>`;
-    return `<form class="edit-form" data-form="update"><h3>Edit issue</h3>${field('title', 'Title')}${field('description', 'Description', true)}
-      <div class="dialog__row"><label class="field">Priority<select name="priority" data-input="edit"${disabled()}>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(values.priority, String(value))}>P${value}</option>`).join('')}</select></label>${field('assignee', 'Assignee')}</div>
-      ${field('notes', 'Notes', true)}${field('acceptance', 'Acceptance criteria', true)}${field('design', 'Design', true)}
+    return `<form class="edit-form" data-form="update"><h3>${t("Edit issue", "编辑议题")}</h3>${field('title', t("Title", "标题"))}${field('description', t("Description", "描述"), true)}
+      <div class="dialog__row"><label class="field">${t("Priority", "优先级")}<select name="priority" data-input="edit"${disabled()}>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(values.priority, String(value))}>P${value}</option>`).join('')}</select></label>${field('assignee', t("Assignee", "负责人"))}</div>
+      ${field('notes', t("Notes", "备注"), true)}${field('acceptance', t("Acceptance criteria", "验收标准"), true)}${field('design', t("Design", "设计"), true)}
       <div class="command" data-command="update">${escapeHtml(updateCommand(issue.id, changes))}</div>
-      <div class="detail__actions"><button class="btn btn--primary" type="submit" data-update-submit${pending || !Object.keys(changes).length || !values.title.trim() ? ' disabled' : ''}>Save changes</button><button class="btn btn--text" type="button" data-action="cancel-edit"${disabled()}>Cancel</button></div></form>`;
+      <div class="detail__actions"><button class="btn btn--primary" type="submit" data-update-submit${pending || !Object.keys(changes).length || !values.title.trim() ? ' disabled' : ''}>${t("Save changes", "保存更改")}</button><button class="btn btn--text" type="button" data-action="cancel-edit"${disabled()}>${t("Cancel", "取消")}</button></div></form>`;
   }
 
   function commentsSection(issue: Issue): string {
     const text = commentDrafts.get(draftKey(issue.id)) ?? '';
     const command = `bd --json --no-color comment -- ${shell(issue.id)} ${shell(text.trim())}`;
-    return `<section class="detail__section"><h3>Comments</h3>
-      ${commentsLoading ? '<p class="muted" role="status">Loading comments…</p>' : ''}
-      ${commentsError ? `<p class="detail__error" role="alert">${escapeHtml(commentsError)} <button class="btn btn--text btn--sm" type="button" data-action="retry-comments">Retry</button></p>` : ''}
-      ${comments.length ? `<ol class="comment-list">${comments.map((comment) => `<li><div class="comment-list__meta"><strong>${escapeHtml(comment.author)}</strong><span>${escapeHtml(relativeTime(comment.created_at) || comment.created_at)}</span></div><p class="detail__prose">${escapeHtml(comment.text)}</p></li>`).join('')}</ol>` : (!commentsLoading && !commentsError ? '<p class="muted">No comments yet.</p>' : '')}
-      <form class="comment-form" data-form="comment"><label class="field">Add a comment<textarea name="text" data-input="comment" rows="3" required${disabled()}>${escapeHtml(text)}</textarea></label><div class="command" data-command="comment">${escapeHtml(command)}</div><button class="btn btn--outlined" type="submit" data-comment-submit${pending || !text.trim() ? ' disabled' : ''}>Add comment</button></form></section>`;
+    return `<section class="detail__section"><h3>${t("Comments", "评论")}</h3>
+      ${commentsLoading ? `<p class="muted" role="status">${t("Loading comments…", "正在加载评论…")}</p>` : ''}
+      ${commentsError ? `<p class="detail__error" role="alert">${escapeHtml(commentsError)} <button class="btn btn--text btn--sm" type="button" data-action="retry-comments">${t("Retry", "重试")}</button></p>` : ''}
+      ${comments.length ? `<ol class="comment-list">${comments.map((comment) => `<li><div class="comment-list__meta"><strong>${escapeHtml(comment.author)}</strong><span>${escapeHtml(relativeTime(comment.created_at) || comment.created_at)}</span></div><p class="detail__prose">${escapeHtml(comment.text)}</p></li>`).join('')}</ol>` : (!commentsLoading && !commentsError ? `<p class="muted">${t("No comments yet.", "还没有评论。")}</p>` : '')}
+      <form class="comment-form" data-form="comment"><label class="field">${t("Add a comment", "添加评论")}<textarea name="text" data-input="comment" rows="3" required${disabled()}>${escapeHtml(text)}</textarea></label><div class="command" data-command="comment">${escapeHtml(command)}</div><button class="btn btn--outlined" type="submit" data-comment-submit${pending || !text.trim() ? ' disabled' : ''}>${t("Add comment", "添加评论")}</button></form></section>`;
   }
 
  
@@ -572,49 +592,49 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const choices = matching.slice(0, 40);
     const chosen = dependencyId ? byId(dependencyId) : undefined;
     if (chosen && !choices.some((candidate) => candidate.id === chosen.id)) choices.unshift(chosen);
-    return `<div class="detail"><div class="detail__top">${icon(typeIcons[issue.type] ?? 'task_alt')}<span class="mono">${escapeHtml(issue.id)}</span>${priority(issue)}<span class="detail__spacer"></span><button type="button" class="btn btn--icon" data-action="close-detail" aria-label="Close issue details">${icon('close')}</button></div>
+    return `<div class="detail"><div class="detail__top">${icon(typeIcons[issue.type] ?? 'task_alt')}<span class="mono">${escapeHtml(issue.id)}</span>${priority(issue)}<span class="detail__spacer"></span><button type="button" class="btn btn--icon" data-action="close-detail" aria-label="${t("Close issue details", "关闭议题详情")}">${icon('close')}</button></div>
       <h2 class="detail__title">${escapeHtml(issue.title)}</h2><div class="detail__actions">${detailActions(issue)}</div>
       ${editSection(issue)}
-      <dl class="meta-list"><dt>Status</dt><dd>${escapeHtml(issue.status || 'Unknown')}</dd><dt>View group</dt><dd>${bead(group)} ${escapeHtml(groupNames[group])}${blockedIds.has(issue.id) && issue.status !== 'blocked' ? ' · Blocked by dependencies' : ''}</dd><dt>Type</dt><dd>${escapeHtml(issue.type)}</dd><dt>Assignee</dt><dd>${escapeHtml(issue.assignee || 'Unassigned')}</dd><dt>Updated</dt><dd>${escapeHtml(relativeTime(issue.updatedAt) || 'Unknown')}</dd>${issue.labels.length ? `<dt>Labels</dt><dd>${issue.labels.map((label) => `<span class="chip chip--label">${escapeHtml(label)}</span>`).join(' ')}</dd>` : ''}</dl>
-      ${detailLoading ? '<p class="muted" role="status">Loading issue details…</p>' : ''}${detailError ? `<p class="detail__error" role="alert">${escapeHtml(detailError)} <button class="btn btn--text btn--sm" type="button" data-action="retry-detail">Retry</button></p>` : ''}
-      ${issue.description ? `<section class="detail__section"><h3>Description</h3><p class="detail__prose">${escapeHtml(issue.description)}</p></section>` : ''}
-      ${issue.acceptance ? `<section class="detail__section"><h3>Acceptance criteria</h3><p class="detail__prose">${escapeHtml(issue.acceptance)}</p></section>` : ''}
-      ${issue.notes ? `<section class="detail__section"><h3>Notes</h3><p class="detail__prose">${escapeHtml(issue.notes)}</p></section>` : ''}
-      ${issue.design ? `<section class="detail__section"><h3>Design</h3><p class="detail__prose">${escapeHtml(issue.design)}</p></section>` : ''}
+      <dl class="meta-list"><dt>${t("Status", "状态")}</dt><dd>${escapeHtml(issue.status ? statusLabel(issue.status) : t("Unknown", "未知"))}</dd><dt>${t("View group", "视图分组")}</dt><dd>${bead(group)} ${escapeHtml(groupLabel(group))}${blockedIds.has(issue.id) && issue.status !== 'blocked' ? t(" · Blocked by dependencies", " · 被依赖阻塞") : ''}</dd><dt>${t("Type", "类型")}</dt><dd>${escapeHtml(typeLabel(issue.type))}</dd><dt>${t("Assignee", "负责人")}</dt><dd>${escapeHtml(issue.assignee || t("Unassigned", "未指派"))}</dd><dt>${t("Updated", "更新")}</dt><dd>${escapeHtml(relativeTime(issue.updatedAt) || t("Unknown", "未知"))}</dd>${issue.labels.length ? `<dt>${t("Labels", "标签")}</dt><dd>${issue.labels.map((label) => `<span class="chip chip--label">${escapeHtml(label)}</span>`).join(' ')}</dd>` : ''}</dl>
+      ${detailLoading ? `<p class="muted" role="status">${t("Loading issue details…", "正在加载议题详情…")}</p>` : ''}${detailError ? `<p class="detail__error" role="alert">${escapeHtml(detailError)} <button class="btn btn--text btn--sm" type="button" data-action="retry-detail">${t("Retry", "重试")}</button></p>` : ''}
+      ${issue.description ? `<section class="detail__section"><h3>${t("Description", "描述")}</h3><p class="detail__prose">${escapeHtml(issue.description)}</p></section>` : ''}
+      ${issue.acceptance ? `<section class="detail__section"><h3>${t("Acceptance criteria", "验收标准")}</h3><p class="detail__prose">${escapeHtml(issue.acceptance)}</p></section>` : ''}
+      ${issue.notes ? `<section class="detail__section"><h3>${t("Notes", "备注")}</h3><p class="detail__prose">${escapeHtml(issue.notes)}</p></section>` : ''}
+      ${issue.design ? `<section class="detail__section"><h3>${t("Design", "设计")}</h3><p class="detail__prose">${escapeHtml(issue.design)}</p></section>` : ''}
       ${product.documents(issue)}
-      <section class="detail__section"><h3>Dependencies</h3>${deps.length ? `<ul class="thread">${deps.map((dep) => `<li><span class="thread__node">${bead(byId(dep.id) ? groupOf(byId(dep.id) as Issue) : 'other')}</span><span><button type="button" class="text-link" data-action="select" data-id="${escapeHtml(dep.id)}"${byId(dep.id) ? '' : ' disabled'}>${escapeHtml(byId(dep.id)?.title || dep.id)}</button><span class="thread__meta mono">${escapeHtml(dep.id)} · ${escapeHtml(dep.type)}</span></span><button type="button" class="btn btn--icon" data-action="unlink" data-id="${escapeHtml(issue.id)}" data-depends="${escapeHtml(dep.id)}" aria-label="Remove dependency ${escapeHtml(dep.id)}" title="${escapeHtml(actionCommand('unlink', issue.id, dep.id))}"${disabled()}>${icon('close')}</button></li>`).join('')}</ul>` : '<p class="muted">No dependencies.</p>'}
-      ${dependents.length ? `<p class="muted">Referenced by</p><ul class="thread">${dependents.map((other) => `<li><span class="thread__node">${bead(groupOf(other))}</span><button type="button" class="text-link" data-action="select" data-id="${escapeHtml(other.id)}">${escapeHtml(other.title)} <span class="mono">${escapeHtml(other.id)}</span></button></li>`).join('')}</ul>` : ''}
-      ${candidates.length ? `<form class="dependency-form" data-form="link"><label>Search issues<input type="search" data-input="dependency-search" data-focus="dependency-search" placeholder="Title or ID" value="${escapeHtml(dependencySearch)}"${disabled()}></label><label>Link issue<select name="dependsOn" data-input="dependency" aria-label="Dependency issue"${disabled()}><option value="">Choose an issue</option>${choices.map((candidate) => `<option value="${escapeHtml(candidate.id)}"${selected(dependencyId, candidate.id)}>${escapeHtml(candidate.id)} · ${escapeHtml(candidate.title)}</option>`).join('')}</select></label>${matching.length > 40 ? `<span class="muted">${matching.length - 40} more; refine the search.</span>` : ''}<label>Relationship<select name="type" data-input="dependency-type" aria-label="Dependency relationship"${disabled()}>${['blocks', 'parent-child', 'related', 'discovered-from'].map((type) => `<option value="${type}"${selected(dependencyType, type)}>${type}</option>`).join('')}</select></label><button class="btn btn--outlined" type="submit" data-link-submit${pending || !dependencyId ? ' disabled' : ''}>${icon('add_link')}Link</button><code class="command dependency-form__command" data-command="link">${escapeHtml(actionCommand('link', issue.id, dependencyId || 'ISSUE', dependencyType))}</code></form>` : ''}</section>
+      <section class="detail__section"><h3>${t("Dependencies", "依赖")}</h3>${deps.length ? `<ul class="thread">${deps.map((dep) => `<li><span class="thread__node">${bead(byId(dep.id) ? groupOf(byId(dep.id) as Issue) : 'other')}</span><span><button type="button" class="text-link" data-action="select" data-id="${escapeHtml(dep.id)}"${byId(dep.id) ? '' : ' disabled'}>${escapeHtml(byId(dep.id)?.title || dep.id)}</button><span class="thread__meta mono">${escapeHtml(dep.id)} · ${escapeHtml(relationLabel(dep.type))}</span></span><button type="button" class="btn btn--icon" data-action="unlink" data-id="${escapeHtml(issue.id)}" data-depends="${escapeHtml(dep.id)}" aria-label="${t('Remove dependency {id}', '移除依赖 {id}', { id: escapeHtml(dep.id) })}" title="${escapeHtml(actionCommand('unlink', issue.id, dep.id))}"${disabled()}>${icon('close')}</button></li>`).join('')}</ul>` : `<p class="muted">${t("No dependencies.", "没有依赖。")}</p>`}
+      ${dependents.length ? `<p class="muted">${t("Referenced by", "被引用")}</p><ul class="thread">${dependents.map((other) => `<li><span class="thread__node">${bead(groupOf(other))}</span><button type="button" class="text-link" data-action="select" data-id="${escapeHtml(other.id)}">${escapeHtml(other.title)} <span class="mono">${escapeHtml(other.id)}</span></button></li>`).join('')}</ul>` : ''}
+      ${candidates.length ? `<form class="dependency-form" data-form="link"><label>${t("Search issues", "搜索议题")}<input type="search" data-input="dependency-search" data-focus="dependency-search" placeholder="${t("Title or ID", "标题或 ID")}" value="${escapeHtml(dependencySearch)}"${disabled()}></label><label>${t("Link issue", "关联议题")}<select name="dependsOn" data-input="dependency" aria-label="${t("Dependency issue", "依赖议题")}"${disabled()}><option value="">${t("Choose an issue", "选择议题")}</option>${choices.map((candidate) => `<option value="${escapeHtml(candidate.id)}"${selected(dependencyId, candidate.id)}>${escapeHtml(candidate.id)} · ${escapeHtml(candidate.title)}</option>`).join('')}</select></label>${matching.length > 40 ? `<span class="muted">${matching.length - 40}${t(" more; refine the search.", " 条未显示，缩小搜索。")}</span>` : ''}<label>${t("Relationship", "关系")}<select name="type" data-input="dependency-type" aria-label="${t("Dependency relationship", "关系")}"${disabled()}>${['blocks', 'parent-child', 'related', 'discovered-from'].map((type) => `<option value="${type}"${selected(dependencyType, type)}>${relationLabel(type)}</option>`).join('')}</select></label><button class="btn btn--outlined" type="submit" data-link-submit${pending || !dependencyId ? ' disabled' : ''}>${icon('add_link')}${t("Link", "关联")}</button><code class="command dependency-form__command" data-command="link">${escapeHtml(actionCommand('link', issue.id, dependencyId || 'ISSUE', dependencyType))}</code></form>` : ''}</section>
       ${commentsSection(issue)}
       <div class="command"><span>$ </span>${escapeHtml(actionCommand(group === 'ready' ? 'claim' : group === 'closed' ? 'reopen' : 'close', issue.id))}</div></div>`;
   }
 
   function createDialog(): string {
     if (!createOpen) return '';
-    return `<dialog class="dialog" aria-labelledby="create-heading"><form data-form="create"><header class="dialog__header"><h2 id="create-heading">New issue</h2><button type="button" class="btn btn--icon" data-action="cancel-create" aria-label="Close">${icon('close')}</button></header><div class="dialog__body"><label class="field">Title<input name="title" data-input="draft" data-focus="create-title" value="${escapeHtml(draft.title)}" placeholder="What needs to be done?" required maxlength="300"${disabled()}></label><div class="dialog__row"><label class="field">Type<select name="type" data-input="draft"${disabled()}>${types.map((type) => `<option value="${type}"${selected(draft.type, type)}>${type}</option>`).join('')}</select></label><label class="field">Priority<select name="priority" data-input="draft"${disabled()}>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(draft.priority, String(value))}>P${value}</option>`).join('')}</select></label></div><label class="field">Description<textarea name="description" data-input="draft" rows="4" placeholder="Context, links, what done looks like"${disabled()}>${escapeHtml(draft.description)}</textarea></label><label class="field">Assignee<input name="assignee" data-input="draft" value="${escapeHtml(draft.assignee)}" autocomplete="off"${disabled()}></label><label class="field">Labels, comma separated<input name="labels" data-input="draft" value="${escapeHtml(draft.labels)}" autocomplete="off"${disabled()}></label><div class="command" aria-label="Equivalent command"><span>$ </span><span data-command="create">${escapeHtml(createCommand(draft))}</span></div>${actionError ? `<p class="detail__error" role="alert">${escapeHtml(actionError)}</p>` : ''}</div><footer class="dialog__actions"><button type="button" class="btn btn--text" data-action="cancel-create"${disabled()}>Cancel</button><button type="submit" class="btn btn--primary"${disabled()}>${pending ? 'Creating…' : 'Create issue'}</button></footer></form></dialog>`;
+    return `<dialog class="dialog" aria-labelledby="create-heading"><form data-form="create"><header class="dialog__header"><h2 id="create-heading">${t("New issue", "新建议题")}</h2><button type="button" class="btn btn--icon" data-action="cancel-create" aria-label="${t("Close", "关闭")}">${icon('close')}</button></header><div class="dialog__body"><label class="field">${t("Title", "标题")}<input name="title" data-input="draft" data-focus="create-title" value="${escapeHtml(draft.title)}" placeholder="${t("What needs to be done?", "要做什么？")}" required maxlength="300"${disabled()}></label><div class="dialog__row"><label class="field">${t("Type", "类型")}<select name="type" data-input="draft"${disabled()}>${types.map((type) => `<option value="${type}"${selected(draft.type, type)}>${typeLabel(type)}</option>`).join('')}</select></label><label class="field">${t("Priority", "优先级")}<select name="priority" data-input="draft"${disabled()}>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}"${selected(draft.priority, String(value))}>P${value}</option>`).join('')}</select></label></div><label class="field">${t("Description", "描述")}<textarea name="description" data-input="draft" rows="4" placeholder="${t("Context, links, what done looks like", "背景、链接、怎样算做完")}"${disabled()}>${escapeHtml(draft.description)}</textarea></label><label class="field">${t("Assignee", "负责人")}<input name="assignee" data-input="draft" value="${escapeHtml(draft.assignee)}" autocomplete="off"${disabled()}></label><label class="field">${t("Labels, comma separated", "标签，用逗号分隔")}<input name="labels" data-input="draft" value="${escapeHtml(draft.labels)}" autocomplete="off"${disabled()}></label><div class="command" aria-label="${t("Equivalent command", "对应命令")}"><span>$ </span><span data-command="create">${escapeHtml(createCommand(draft))}</span></div>${actionError ? `<p class="detail__error" role="alert">${escapeHtml(actionError)}</p>` : ''}</div><footer class="dialog__actions"><button type="button" class="btn btn--text" data-action="cancel-create"${disabled()}>${t("Cancel", "取消")}</button><button type="submit" class="btn btn--primary"${disabled()}>${pending ? t("Creating…", "创建中…") : t("Create issue", "创建")}</button></footer></form></dialog>`;
   }
 
   function appBar(): string {
     const project = projects.find((item) => item.id === projectId);
-    const sync = project ? `${projectAvailability(project)}${snapshot ? ` · ${relativeTime(snapshot.fetchedAt) || snapshot.fetchedAt}` : ''}` : 'Refresh';
-    return `<header class="app-bar"><div class="brand"><span class="brand__mark">${bead('closed')}${bead('active')}${bead('ready')}</span><span>beads</span></div><div class="app-bar__search">${searchField()}</div><div class="app-bar__actions"><button type="button" class="btn btn--text btn--sm" data-action="refresh" aria-label="${projectId ? 'Refresh issues' : 'Refresh projects'}" title="${escapeHtml(sync)}"${pending || loadingSnapshot || loadingProjects ? ' disabled' : ''}>${icon('sync')}<span>${escapeHtml(sync)}</span></button></div></header>`;
+    const sync = project ? `${projectAvailability(project)}${snapshot ? ` · ${relativeTime(snapshot.fetchedAt) || snapshot.fetchedAt}` : ''}` : t("Refresh", "刷新");
+    return `<header class="app-bar"><div class="brand"><span class="brand__mark">${bead('closed')}${bead('active')}${bead('ready')}</span><span>beads</span></div><div class="app-bar__search">${searchField()}</div><div class="app-bar__actions"><button type="button" class="btn btn--text btn--sm" data-action="refresh" aria-label="${projectId ? t('Refresh issues', '刷新议题') : t('Refresh projects', '刷新项目')}" title="${escapeHtml(sync)}"${pending || loadingSnapshot || loadingProjects ? ' disabled' : ''}>${icon('sync')}<span>${escapeHtml(sync)}</span></button></div></header>`;
   }
   function mainHead(): string {
     const groups: Array<Group | 'all'> = ['all', 'ready', 'active', 'blocked'];
     if (!groups.includes(view)) groups.push(view);
     const effectiveLayout = view === 'all' ? layout : 'table';
-    const epicLabel = !epicFilter ? 'All epics' : epicFilter.id === null ? 'No epic' : model?.byId.get(epicFilter.id)?.title || epicFilter.id;
-    const scopeParts = [epicLabel, typeFilter, priorityFilter ? `P${priorityFilter}` : '', assigneeFilter, query.trim() ? `search: “${query.trim()}”` : ''].filter(Boolean);
+    const epicLabel = !epicFilter ? t("All epics", "全部需求") : epicFilter.id === null ? t("No epic", "无需求") : model?.byId.get(epicFilter.id)?.title || epicFilter.id;
+    const scopeParts = [epicLabel, typeFilter, priorityFilter ? `P${priorityFilter}` : '', assigneeFilter, query.trim() ? t('search: “{q}”', '搜索：“{q}”', { q: query.trim() }) : ''].filter(Boolean);
     const visibleIds = new Set(filtered().map((issue) => issue.id));
     const hiddenSelection = [...taskPool.values()].filter((item) => item.project !== projectId || !visibleIds.has(item.id)).length;
-    return `<div class="main__head"><div class="main__title-row"><h1 class="visually-hidden" tabindex="-1" data-focus="board-heading">${view === 'all' ? 'All issues' : escapeHtml(groupNames[view])}</h1><div class="summary" role="group" aria-label="Issue views">${groups.map((group) => {
-      const label = group === 'all' ? 'All issues' : groupNames[group];
-      return `<button type="button" class="view-button" data-action="view" data-value="${group}" data-focus="header-view-${group}" aria-pressed="${pressed(view === group)}" aria-label="${escapeHtml(label)}, ${snapshot ? `${count(group)} issues matching filters` : 'issues not loaded'}"><span>${escapeHtml(label)}</span><span class="view-button__count" aria-hidden="true">${snapshot ? count(group) : '—'}</span></button>`;
-    }).join('')}</div><div class="segmented" role="group" aria-label="Issue layout"><button type="button" data-action="layout" data-value="board" aria-pressed="${pressed(effectiveLayout === 'board')}"${view !== 'all' ? ' disabled title="Board is available in All issues; status views use Table"' : ' title="Board layout"'}>${icon('view_kanban')}Board</button><button type="button" data-action="layout" data-value="table" aria-pressed="${pressed(effectiveLayout === 'table')}" title="Table layout">${icon('table_rows')}Table</button></div></div><p class="scope-note"><strong>Scope:</strong> ${escapeHtml(scopeParts.join(' · '))}${view === 'all' ? ` · closed ${showClosed ? 'included' : 'hidden'}` : ''}${snapshot ? ` · ${filtered().length} shown` : ''}${taskPool.size ? ` · ${taskPool.size} selected${hiddenSelection ? ` · ${hiddenSelection} hidden by filters or project` : ''}` : ''}${offline() && snapshot ? ' · stale' : ''}</p><div class="main__tools">${filters(hiddenSelection)}<div class="product-controls">${product.controls()}<button type="button" class="btn btn--icon" data-action="spotlight" aria-label="Highlight dependencies" aria-pressed="${pressed(spotlightOn)}" title="Highlight dependencies on hover or focus">${icon('account_tree')}</button></div></div>${scope ? '<p class="muted">Saved filter scope limits project choices. Clear filters to see all projects.</p>' : ''}</div>`;
+    return `<div class="main__head"><div class="main__title-row"><h1 class="visually-hidden" tabindex="-1" data-focus="board-heading">${view === 'all' ? t("All issues", "全部议题") : escapeHtml(groupLabel(view))}</h1><div class="summary" role="group" aria-label="${t("Issue views", "议题视图")}">${groups.map((group) => {
+      const label = group === 'all' ? t("All issues", "全部议题") : groupLabel(group);
+      return `<button type="button" class="view-button" data-action="view" data-value="${group}" data-focus="header-view-${group}" aria-pressed="${pressed(view === group)}" aria-label="${escapeHtml(label)}, ${snapshot ? t('{n} matching filters', '{n} 条符合筛选', { n: count(group) }) : t('issues not loaded', '议题还没加载')}"><span>${escapeHtml(label)}</span><span class="view-button__count" aria-hidden="true">${snapshot ? count(group) : '—'}</span></button>`;
+    }).join('')}</div><div class="segmented" role="group" aria-label="${t("Issue layout", "议题布局")}"><button type="button" data-action="layout" data-value="board" aria-pressed="${pressed(effectiveLayout === 'board')}"${view !== 'all' ? ` disabled title="${t("Board is available in All issues; status views use Table", "看板只在「全部议题」里用，状态视图用表格")}"` : ` title="${t("Board layout", "看板")}"`}>${icon('view_kanban')}${t("Board", "看板")}</button><button type="button" data-action="layout" data-value="table" aria-pressed="${pressed(effectiveLayout === 'table')}" title="${t("Table layout", "表格")}">${icon('table_rows')}${t("Table", "表格")}</button></div></div><p class="scope-note"><strong>${t("Scope:", "范围：")}</strong> ${escapeHtml(scopeParts.join(' · '))}${view === 'all' ? `${t(" · closed ", " · 已关闭 ")}${showClosed ? t("included", "含") : t("hidden", "不含")}` : ''}${snapshot ? ` · ${filtered().length}${t(" shown", " 条")}` : ''}${taskPool.size ? ` · ${taskPool.size}${t(" selected", " 已选")}${hiddenSelection ? ` · ${hiddenSelection}${t(" hidden by filters or project", " 被筛选或项目挡住")}` : ''}` : ''}${offline() && snapshot ? t(" · stale", " · 过期") : ''}</p><div class="main__tools">${filters(hiddenSelection)}<div class="product-controls">${product.controls()}<button type="button" class="btn btn--icon" data-action="spotlight" aria-label="${t("Highlight dependencies", "高亮依赖")}" aria-pressed="${pressed(spotlightOn)}" title="${t("Highlight dependencies on hover or focus", "悬停或聚焦时高亮依赖")}">${icon('account_tree')}</button></div></div>${scope ? `<p class="muted">${t("Saved filter scope limits project choices. Clear filters to see all projects.", "已保存的筛选范围限制了可选项目。清除筛选以查看全部项目。")}</p>` : ''}</div>`;
   }
 
   function loadingState(): string {
-    const label = loadingProjects ? 'Loading projects…' : 'Loading issues…';
+    const label = loadingProjects ? t("Loading projects…", "正在加载项目…") : t("Loading issues…", "正在加载议题…");
     const line = '<span class="skeleton-line"></span>';
     const card = `<div class="skeleton-card"><div class="skeleton-card__meta">${line}${line}</div><span class="skeleton-line skeleton-line--title"></span><span class="skeleton-line skeleton-line--short"></span><div class="skeleton-card__meta">${line}${line}</div></div>`;
     const table = view !== 'all' || layout === 'table';
@@ -626,8 +646,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
 
   function bodyState(): string {
     if (!snapshot && (loadingProjects || loadingSnapshot)) return loadingState();
-    if (!snapshot && loadError) return `<div class="empty-state empty-state--error" role="alert"><h2>${loadErrorSource === 'projects' ? 'Projects unavailable' : 'Issues unavailable'}</h2><p>${loadErrorSource === 'projects' ? 'Could not load the project list.' : 'Could not load issues for this project.'} Try again to reconnect.</p><details data-persist="load-details"><summary data-focus="load-details">Technical details</summary><p>${escapeHtml(loadError)}</p></details><button class="btn btn--outlined" type="button" data-action="retry"${pending ? ' disabled' : ''}>Retry loading</button></div>`;
-    if (!projects.length) return '<div class="empty-state"><h2>No projects available</h2><p>Add a local Beads workspace in Orca or an additional project path in the plugin settings, then refresh.</p><button class="btn btn--outlined" type="button" data-action="retry">Refresh</button></div>';
+    if (!snapshot && loadError) return `<div class="empty-state empty-state--error" role="alert"><h2>${loadErrorSource === 'projects' ? t("Projects unavailable", "项目不可用") : t("Issues unavailable", "议题不可用")}</h2><p>${loadErrorSource === 'projects' ? t("Could not load the project list.", "无法加载项目列表。") : t("Could not load issues for this project.", "无法加载这个项目的议题。")}${t(" Try again to reconnect.", " 再试一次以重连。")}</p><details data-persist="load-details"><summary data-focus="load-details">${t("Technical details", "技术细节")}</summary><p>${escapeHtml(loadError)}</p></details><button class="btn btn--outlined" type="button" data-action="retry"${pending ? ' disabled' : ''}>${t("Retry loading", "重新加载")}</button></div>`;
+    if (!projects.length) return `<div class="empty-state"><h2>${t("No projects available", "没有可用项目")}</h2><p>${t("Add a local Beads workspace in Orca or an additional project path in the plugin settings, then refresh.", "在 Orca 里添加本地 Beads 工作区，或在插件设置里添加项目路径，然后刷新。")}</p><button class="btn btn--outlined" type="button" data-action="retry">${t("Refresh", "刷新")}</button></div>`;
     if (!snapshot) return loadingState();
     return '';
   }
@@ -645,6 +665,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
 
   function render(): void {
     if (disposed) return;
+    syncPanelLocale();
     rendering = true;
     const active = document.activeElement instanceof HTMLElement && root.contains(document.activeElement) ? document.activeElement : null;
     const hadProductDialog = !!root.querySelector('[data-product-dialog]');
@@ -670,7 +691,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const dialogTop = root.querySelector<HTMLElement>('.dialog__body')?.scrollTop || 0;
     const pickerTop = root.querySelector<HTMLElement>('.project-picker__list')?.scrollTop || 0;
     if (!initialized) {
-      root.innerHTML = '<div class="app"><div class="island-contents" data-island="bar"></div><div class="island-contents" data-island="rail"></div><main class="main"><div class="island-contents" data-island="head"></div><div class="island-contents" data-island="banners"></div><div class="content-island" data-island="content"></div></main><aside class="drawer" data-island="drawer" aria-label="Issue details" hidden></aside></div><div class="island-contents" data-island="create"></div><div class="island-contents" data-island="product"></div>';
+      root.innerHTML = `<div class="app"><div class="island-contents" data-island="bar"></div><div class="island-contents" data-island="rail"></div><main class="main"><div class="island-contents" data-island="head"></div><div class="island-contents" data-island="banners"></div><div class="content-island" data-island="content"></div></main><aside class="drawer" data-island="drawer" aria-label="${t("Issue details", "议题详情")}" hidden></aside></div><div class="island-contents" data-island="create"></div><div class="island-contents" data-island="product"></div>`;
       initialized = true;
     }
     patchIsland('bar', appBar());
@@ -761,21 +782,30 @@ export function mount(root: HTMLElement, transport: Transport): void {
         const result = await transport.request<Project[]>({ method: 'projects' });
         if (disposed) return;
         projects = result;
-        if (!projects.some((project) => project.id === projectId)) {
-          const current = projects.filter((project) => project.current);
-          projectId = (!projectId && current.length === 1 ? current[0]?.id : undefined) || projects[0]?.id || '';
+        try {
+          const diagnostics = await transport.request<{ pathErrors?: string[]; refreshMs?: number }>({ method: 'diagnostics' });
+          pathErrors = Array.isArray(diagnostics.pathErrors) ? diagnostics.pathErrors : [];
+          if (typeof diagnostics.refreshMs === 'number' && diagnostics.refreshMs >= 5_000 && diagnostics.refreshMs !== refreshMs) {
+            refreshMs = diagnostics.refreshMs;
+            armRefresh();
+          }
+        } catch { pathErrors = []; }
+        const nextProject = preferredProjectId(projects, rememberedProject(), projectId);
+        if (nextProject !== projectId) {
+          projectId = nextProject;
           snapshot = null; issueIndex.clear(); blockedIds.clear();
           model = null; modelSignature = ''; modelVersion++; epicFilter = undefined; resetEpicListFilters();
           selectedId = ''; detail = null; detailSequence++; commentsSequence++;
           comments = []; commentsError = ''; undoClose = null;
         }
+        if (projectId) rememberProject(projectId);
         loadingProjects = false;
         if (projectId) await refresh();
         else { snapshot = null; render(); }
       } catch (error) {
         if (disposed) return;
         loadingProjects = false;
-        loadError = textError(error) || 'No technical details were provided.'; loadErrorSource = 'projects'; connectionLost = !!snapshot;
+        loadError = textError(error) || t("No technical details were provided.", "没有更多信息。"); loadErrorSource = 'projects'; connectionLost = !!snapshot;
         render();
       }
     })();
@@ -800,7 +830,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
       try {
         const result = await transport.request<Snapshot>({ method: 'snapshot', project: requestedProject });
         if (disposed || projectId !== requestedProject) return;
-        if (result.project.id !== requestedProject) throw new Error('Beads returned data for a different project.');
+        if (result.project.id !== requestedProject) throw new Error(t("Beads returned data for a different project.", "Beads 返回了另一个项目的数据。"));
         const signature = JSON.stringify([result.project.id, result.issues, result.readyIds, result.blockedIds]);
         if (!model || signature !== modelSignature) {
           model = createIssueModel(result);
@@ -819,7 +849,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
         } else if (selectedId && result.offline) {
           detail = result.issues.find((issue) => issue.id === selectedId) || null;
           detailSequence++; detailLoading = false; detailError = '';
-          commentsSequence++; comments = []; commentsLoading = false; commentsError = 'Comments are unavailable offline.';
+          commentsSequence++; comments = []; commentsLoading = false; commentsError = t("Comments are unavailable offline.", "离线时没有评论。");
         } else if (selectedId) {
           const id = selectedId;
           void product.loadDocuments(requestedProject, id, result.issues.find((issue) => issue.id === id)?.updatedAt || '');
@@ -837,7 +867,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
           if (!disposed && projectId === requestedProject && selectedId === id) await loadComments(id, true);
         }
       } catch (error) {
-        if (!disposed && projectId === requestedProject) { connectionLost = true; loadError = textError(error) || 'No technical details were provided.'; loadErrorSource = 'snapshot'; }
+        if (!disposed && projectId === requestedProject) { connectionLost = true; loadError = textError(error) || t("No technical details were provided.", "没有更多信息。"); loadErrorSource = 'snapshot'; }
       } finally {
         if (!disposed && projectId === requestedProject) { loadingSnapshot = false; render(); }
       }
@@ -849,7 +879,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
   async function loadComments(id: string, quiet = false): Promise<void> {
     const requestedProject = projectId;
     const sequence = ++commentsSequence;
-    if (offline()) { comments = []; commentsLoading = false; commentsError = 'Comments are unavailable offline.'; render(); return; }
+    if (offline()) { comments = []; commentsLoading = false; commentsError = t("Comments are unavailable offline.", "离线时没有评论。"); render(); return; }
     if (!quiet) { commentsLoading = true; commentsError = ''; render(); }
     try {
       const rows = await transport.request<unknown>({ method: 'comments', project: requestedProject, input: { id } });
@@ -857,7 +887,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
         if (!row || typeof row !== 'object') return true;
         const item = row as Record<string, unknown>;
         return ['author', 'text', 'created_at'].some((field) => typeof item[field] !== 'string') || (item.issue_id !== undefined && item.issue_id !== id);
-      })) throw new Error('Beads returned invalid comments for this issue.');
+      })) throw new Error(t("Beads returned invalid comments for this issue.", "这条议题的评论数据无效。"));
       if (!disposed && projectId === requestedProject && selectedId === id && sequence === commentsSequence) {
         comments = rows as Comment[]; commentsError = '';
       }
@@ -881,7 +911,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     dependencySearch = '';
     if (offline()) {
       detail = byId(id) || null; detailLoading = false; commentsSequence++;
-      comments = []; commentsLoading = false; commentsError = 'Comments are unavailable offline.';
+      comments = []; commentsLoading = false; commentsError = t("Comments are unavailable offline.", "离线时没有评论。");
       render(); return;
     }
     render();
@@ -905,7 +935,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     render();
     try {
       if (refreshTask) await refreshTask;
-      if (offline()) throw new Error('The project is offline. No change was sent.');
+      if (offline()) throw new Error(t("The project is offline. No change was sent.", "项目离线，没有提交修改。"));
       const before = snapshotGeneration;
       await transport.request({ method, project: requestedProject, input });
       if (disposed || projectId !== requestedProject) return;
@@ -937,12 +967,12 @@ export function mount(root: HTMLElement, transport: Transport): void {
     render();
     try {
       if (refreshTask) await refreshTask;
-      if (offline()) throw new Error('The project is offline. The issue was not reopened.');
+      if (offline()) throw new Error(t("The project is offline. The issue was not reopened.", "项目离线，没有重新打开。"));
       const latest = await transport.request<Issue>({ method: 'issue', project: undo.project, input: { id: undo.id } });
       if (disposed || projectId !== undo.project) return;
       if (latest.status !== 'closed' || latest.updatedAt !== undo.updatedAt || latest.closedAt !== undo.closedAt) {
         undoClose = null;
-        throw new Error('The issue changed after it was closed; it was not reopened.');
+        throw new Error(t("The issue changed after it was closed; it was not reopened.", "关闭后又有改动，没有重新打开。"));
       }
       await transport.request({ method: 'reopen', project: undo.project, input: { id: undo.id } });
       undoClose = null;
@@ -978,7 +1008,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
       const hostName = project ? portableHostName(project) : '';
       const id = value === 'none' ? null : value.startsWith('id:') ? value.slice(3) : '';
       if (!project || (id !== null && model?.byId.get(id)?.type !== 'epic')) {
-        actionError = 'Choose an epic in the selected project.';
+        actionError = t("Choose an epic in the selected project.", "在当前项目里选一个需求。");
         render(); return;
       }
       epicFilter = { id, projectName: project.name, hostName };
@@ -1008,8 +1038,8 @@ export function mount(root: HTMLElement, transport: Transport): void {
   function selectProject(id: string, clearQuery: boolean, preserveEpic = false): void {
     const project = projects.find((item) => item.id === id);
     if (!project || id === projectId) return;
-    if (!inScope(project, scope)) { actionError = 'This project is outside the saved filter scope. Clear filters to view it.'; render(); return; }
-    projectId = id; snapshot = null; issueIndex.clear(); blockedIds.clear();
+    if (!inScope(project, scope)) { actionError = t("This project is outside the saved filter scope. Clear filters to view it.", "这个项目不在已保存的筛选里。清除筛选后再看。"); render(); return; }
+    projectId = id; rememberProject(id); snapshot = null; issueIndex.clear(); blockedIds.clear();
     model = null; modelSignature = ''; modelVersion++; resetEpicListFilters(); if (!preserveEpic) epicFilter = undefined;
     loadingSnapshot = true; connectionLost = false; selectedId = ''; detail = null; detailSequence++; commentsSequence++;
     comments = []; commentsError = ''; commentsLoading = false; undoClose = null;
@@ -1338,12 +1368,12 @@ export function mount(root: HTMLElement, transport: Transport): void {
 
   function dropTransition(issue: Issue, target: Group): { method?: 'claim' | 'close' | 'reopen'; hint: string } {
     const source = groupOf(issue);
-    if (source === target) return { hint: `This issue is already in ${groupNames[target]}.` };
-    if (target === 'blocked') return { hint: 'Blocked includes explicit status and dependency-blocked issues. Set the status in Beads or link a dependency.' };
-    if (target === 'closed' && issue.status !== 'closed') return { method: 'close', hint: 'Close issue' };
-    if (source === 'ready' && target === 'active') return { method: 'claim', hint: 'Claim issue' };
-    if (source === 'closed' && target === 'ready') return { method: 'reopen', hint: 'Reopen issue; it may still be blocked' };
-    return { hint: `Moving from ${groupNames[source]} to ${groupNames[target]} is not supported.` };
+    if (source === target) return { hint: t('This issue is already in {group}.', '已经在{group}。', { group: groupLabel(target) }) };
+    if (target === 'blocked') return { hint: t("Blocked includes explicit status and dependency-blocked issues. Set the status in Beads or link a dependency.", "阻塞列含状态和依赖。到 Beads 里改状态，或加上依赖。") };
+    if (target === 'closed' && issue.status !== 'closed') return { method: 'close', hint: t("Close issue", "关闭") };
+    if (source === 'ready' && target === 'active') return { method: 'claim', hint: t("Claim issue", "认领") };
+    if (source === 'closed' && target === 'ready') return { method: 'reopen', hint: t("Reopen issue; it may still be blocked", "重新打开，可能仍被阻塞") };
+    return { hint: t('Moving from {from} to {to} is not supported.', '不能从{from}移到{to}。', { from: groupLabel(source), to: groupLabel(target) }) };
   }
 
   function endDrag(): void {
@@ -1372,7 +1402,7 @@ export function mount(root: HTMLElement, transport: Transport): void {
     if (!card || !issue || pending || offline() || !event.dataTransfer || event.target instanceof HTMLInputElement) { event.preventDefault(); return; }
     if (loadingSnapshot || loadingProjects || (selectedId && (detailLoading || commentsLoading))) {
       event.preventDefault();
-      actionError = 'Wait for the current refresh or issue details to finish before moving this issue.';
+      actionError = t("Wait for the current refresh or issue details to finish before moving this issue.", "等这次刷新或详情加载完再移动。");
       render();
       return;
     }
@@ -1413,16 +1443,14 @@ export function mount(root: HTMLElement, transport: Transport): void {
     const issue = source.project === projectId ? byId(source.id) : undefined;
     const target = column.dataset.dropGroup as Group;
     endDrag();
-    if (!issue) { actionError = 'The issue or project changed during the drag. Refresh and try again.'; render(); flushAfterDrag(); return; }
+    if (!issue) { actionError = t("The issue or project changed during the drag. Refresh and try again.", "拖动时议题或项目变了。刷新后再试。"); render(); flushAfterDrag(); return; }
     const transition = dropTransition(issue, target);
     if (!transition.method) { actionError = transition.hint; render(); flushAfterDrag(); return; }
     void mutate(transition.method, { id: issue.id });
   }
 
   function onVisibility(): void {
-    if (!document.hidden && !pending && !drag && !refreshTask && !loadingProjects) {
-      if (projectId) void refresh(); else void loadProjects();
-    }
+    if (!document.hidden && !pending && !drag && !refreshTask && !loadingProjects) void loadProjects();
   }
   function onScroll(event: Event): void {
     if (event.target instanceof HTMLElement && event.target.dataset.windowContainer) scheduleWindows();
@@ -1445,10 +1473,15 @@ export function mount(root: HTMLElement, transport: Transport): void {
   document.addEventListener('visibilitychange', onVisibility);
   document.addEventListener('pointerdown', onDocumentPointerDown);
   window.addEventListener('resize', onResize);
-  const timer = window.setInterval(() => {
-    if (!root.isConnected) { cleanup(); return; }
-    if (!document.hidden && projectId && !pending && !drag && !refreshTask) void refresh();
-  }, 15_000);
+  let timer = 0;
+  function armRefresh(): void {
+    window.clearInterval(timer);
+    timer = window.setInterval(() => {
+      if (!root.isConnected) { cleanup(); return; }
+      if (!document.hidden && projectId && !pending && !drag && !refreshTask) void refresh();
+    }, refreshMs);
+  }
+  armRefresh();
   function cleanup(): void {
     disposed = true;
     window.clearInterval(timer);

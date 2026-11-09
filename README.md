@@ -10,12 +10,12 @@
 
 ## Install the stable release
 
-Current release: **v0.2.4**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review.
+Current release: **v0.2.5-ssh.8**. Install the native plugin directly from Git; no source build or development link is needed. Existing-session handoff remains disabled. Community-catalog discovery is separate and may require review. The panel is Simplified Chinese unless Orca's UI language is English.
 
 In Orca, open **Settings → Plugins → Add plugin → From Git URL** and enter:
 
 ```text
-https://github.com/Roflochinsky/beads-orca#v0.2.4
+https://github.com/quzard/beads-orca#v0.2.5-ssh.8
 ```
 
 Alternatively, use the [Orca community catalog](https://onorca.dev/plugins/roflochinsky.beads?catalog=community) once listed. Check the [listing status](https://www.onorca.dev/plugins/roflochinsky/beads-orca) if it is not available there; Git installation does not require a community listing.
@@ -24,7 +24,7 @@ Requirements:
 
 - Orca **1.4.250 or newer**.
 - Beads CLI **1.3.2** on the execution host and an initialized Beads project.
-- POSIX file semantics and `python3` for document/artifact operations; system SSH and explicit configuration for remote hosts.
+- POSIX file semantics, remote `bash`, and `python3` for document/artifact operations. System SSH on the Mac for a Linux dev machine. An Orca SSH host synced from `~/.ssh/config` is used as that alias; `remoteHosts` only overrides it. `bd` must be on the remote PATH used by `bash --noprofile --norc` (the default search path includes `~/.local/bin` and `/usr/local/bin`).
 
 Review the publisher and access request during installation, approve only if you trust the plugin, and open the **Beads Board** panel in Orca. Local Orca workspaces are listed automatically. To add another local project, use **Additional local Beads project paths** in the plugin settings, one absolute project path per line.
 
@@ -81,12 +81,12 @@ This repository is for Orca only. For Tern, see [beads-tern](https://github.com/
 The plugin supports the following workflows:
 
 - **Prepare explicit handoffs:** select tasks across projects, split them into source/target groups, review blockers and explicitly selected whole-file or line-range Markdown context, and choose implementation or research. Changed context rejects Send with details and requires a new preview. New CLI-session launch uses native Orca receipts; sending is not Claim, agent acceptance, or completion.
-- **Work across hosts:** local and explicitly mapped SSH projects, host availability, and timestamped offline snapshots. The Beads source and target code workspace must share an execution host. Unmapped paired hosts stay visible but unsupported.
+- **Work across hosts:** local projects and SSH projects whose Orca host name is a `~/.ssh/config` alias, host availability, and timestamped offline snapshots. The Beads source and target code workspace must share an execution host. Unmapped paired hosts stay visible but unsupported.
 - **Keep context and review explicit:** linked Markdown read/open, personal filters and explicit project-filter publication, private handoff history with export/import/delete, native worktree preview/create, structured per-task reports, and explicit artifact cleanup. No automatic resend, task close, merge, push, or worktree deletion.
 
 **Existing-session handoff remains blocked.** Orca lacks an atomic native idle-only send gate; discovered existing sessions are disabled rather than risk interrupting work.
 
-Development requires Orca **1.4.250+**, Node **24+**, and `bd` **1.3.2** on the execution host. File access requires POSIX semantics and `python3`; remote access also requires system SSH and an explicit `remoteHosts` mapping. See [configuration and trust limits](docs/integration-constraints.md), including the standard native-profile restriction, editor-open race, and SSH-config caveat.
+Development requires Orca **1.4.250+**, Node **24+**, and `bd` **1.3.2** on the execution host. File access requires POSIX semantics and `python3`; remote access also requires system SSH and a `~/.ssh/config` alias (or a `remoteHosts` override). See [configuration and trust limits](docs/integration-constraints.md), including the standard native-profile restriction, editor-open race, and SSH-config caveat.
 
 For 0.2.1, 78 tests, real-`bd` smoke and local build checks passed. The actual Linux Orca panel loaded 1,262 issues through the native bridge without truncation. **Actual model execution, Orca's native macOS UI and real paired-runtime behavior remain unverified.** Provider discovery does not prove authentication; imported history and reported results remain unverified claims for human review.
 

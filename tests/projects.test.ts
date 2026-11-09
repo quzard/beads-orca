@@ -25,8 +25,9 @@ function fixtureHost(workspaces: Workspace[], settings: Record<string, string> =
 }
 
 test('project discovery keeps remote and unsupported host identities distinct from a local twin', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'beads-projects-'));
+    const root = await mkdtemp(join(tmpdir(), 'beads-projects-'));
   try {
+    await mkdir(join(root, '.beads'));
     const workspaces: Workspace[] = [
       { id: 'local', name: 'Local', path: root, hostId: null },
       { id: 'ssh', name: 'Remote twin', path: root, hostId: 'ssh:example' },
@@ -52,21 +53,56 @@ test('project discovery keeps remote and unsupported host identities distinct fr
 });
 
 test('focused workspace is identified only when the available host context is unambiguous', async () => {
-  const workspaces: Workspace[] = [
-    { id: 'one', name: 'Same name', branch: 'main', path: '/first', hostId: null },
-    { id: 'two', name: 'Same name', branch: 'main', path: '/second', hostId: 'runtime:other' },
-  ];
-  const base = fixtureHost(workspaces);
-  const service = new ProjectAccess({
-    settings: base.settings,
-    host: { async call(method, params) {
-      if (method === 'workspace.readContext') return { displayName: 'Same name', branch: 'main', terminals: [] };
-      return base.host.call(method, params);
-    } },
-  });
-  assert.deepEqual((await service.list()).map((project) => project.current), [undefined, undefined]);
-  workspaces.pop();
-  assert.equal((await service.list())[0]?.current, true);
+  const root = await mkdtemp(join(tmpdir(), 'beads-focus-'));
+  const first = join(root, 'first');
+  const second = join(root, 'second');
+  await mkdir(join(first, '.beads'), { recursive: true });
+  await mkdir(join(second, '.beads'), { recursive: true });
+  try {
+    const workspaces: Workspace[] = [
+      { id: 'one', name: 'Same name', branch: 'main', path: first, hostId: null },
+      { id: 'two', name: 'Same name', branch: 'main', path: second, hostId: 'runtime:other' },
+    ];
+    const base = fixtureHost(workspaces);
+    const service = new ProjectAccess({
+      settings: base.settings,
+      host: { async call(method, params) {
+        if (method === 'workspace.readContext') return { displayName: 'Same name', branch: 'main', terminals: [] };
+        return base.host.call(method, params);
+      } },
+    });
+    assert.deepEqual((await service.list()).map((project) => project.current), [undefined, undefined]);
+    workspaces.pop();
+    assert.equal((await service.list())[0]?.current, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an uninitialized local folder is hidden and the focused ssh workspace is selected', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-hide-uninit-'));
+  const documents = join(root, 'Documents');
+  const remote = join(root, 'upsert-umodel-perf');
+  await mkdir(documents);
+  await mkdir(join(remote, '.beads'), { recursive: true });
+  try {
+    const service = new ProjectAccess({
+      settings: { async get() { return ''; } },
+      host: { async call(method) {
+        if (method === 'workspace.list') return { workspaces: [
+          { id: 'docs', name: 'Documents', path: documents, hostId: null, branch: null },
+          { id: 'remote', name: 'upsert-umodel-perf', path: remote, hostId: 'ssh:new_sls', branch: 'main' },
+        ], truncated: false };
+        if (method === 'workspace.readContext') return { displayName: 'upsert-umodel-perf', branch: 'refs/heads/main', terminals: [] };
+        throw new Error(`Unexpected host method: ${method}`);
+      } },
+    });
+    const projects = await service.list();
+    assert.deepEqual(projects.map((project) => project.id), ['remote']);
+    assert.equal(projects[0]?.current, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('confined text access refuses traversal and symlinks, creates parents, and removes only the named file', async () => {
@@ -224,7 +260,7 @@ test('oversized SSH output is an error, not an offline snapshot or a truncated s
   const root = await mkdtemp(join(tmpdir(), 'beads-remote-limit-'));
   const previousPath = process.env.PATH;
   try {
-    await writeFile(join(root, 'ssh'), `#!${process.execPath}\nconst cmd=process.argv.at(-1); if(cmd.includes('pwd -P')) process.stdout.write('/remote/.beads\\n'); else process.stdout.write('x'.repeat(16 * 1024 * 1024 + 1));\n`, { mode: 0o755 });
+    await writeFile(join(root, 'ssh'), `#!${process.execPath}\nconst cmd=process.argv.at(-1); if(!cmd.includes("'--json'")) process.stdout.write('/remote/.beads\\n'); else process.stdout.write('x'.repeat(16 * 1024 * 1024 + 1));\n`, { mode: 0o755 });
     process.env.PATH = `${root}${delimiter}${previousPath ?? ''}`;
     const service = new ProjectAccess(fixtureHost(
       [{ id: 'remote', name: 'Remote', path: '/remote', hostId: 'ssh:server' }],
@@ -275,6 +311,166 @@ test('remote native writes pin the remote store and treat issue text as data, no
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     if (previousDb === undefined) delete process.env.BD_DB; else process.env.BD_DB = previousDb;
     if (previousActor === undefined) delete process.env.BEADS_ACTOR; else process.env.BEADS_ACTOR = previousActor;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('one bad additional path does not hide the other projects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'beads-paths-'));
+  try {
+    await mkdir(join(root, '.beads'));
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'local', name: 'Local', path: root, hostId: null }],
+      { projectPaths: `${join(root, 'missing')}\n${root}` },
+    ));
+    const projects = await service.list();
+    assert.equal(projects.some((project) => project.id === 'local'), true);
+    const diagnostics = await service.request({ method: 'diagnostics' }) as { pathErrors: string[] };
+    assert.equal(diagnostics.pathErrors.length, 1);
+    assert.match(diagnostics.pathErrors[0] ?? '', /missing/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('remote .beads symlinks and login-shell hijacks do not leave the workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-remote-link-'));
+  const previousPath = process.env.PATH;
+  const previousEnv = process.env.BASH_ENV;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const outside = join(root, 'outside');
+    const hijack = join(root, 'hijack.sh');
+    await mkdir(bin);
+    await mkdir(workspace);
+    await mkdir(join(outside, '.beads'), { recursive: true });
+    await symlink(join(outside, '.beads'), join(workspace, '.beads'));
+    await writeFile(hijack, 'bd() { echo HIJACKED; }\n');
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst cp=require('node:child_process'); const result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nprocess.stdout.write('HIJACKED');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    process.env.BASH_ENV = hijack;
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'remote', name: 'Remote', path: workspace, hostId: 'ssh:server' }],
+      { remoteHosts: JSON.stringify({ 'ssh:server': { destination: 'fixture' } }) },
+    ));
+    await assert.rejects(service.request({ method: 'snapshot', project: 'remote' }), /outside the workspace/i);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousEnv === undefined) delete process.env.BASH_ENV; else process.env.BASH_ENV = previousEnv;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('SSH connection test reports bd, python3, and the physical workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-ssh-test-'));
+  const previousPath = process.env.PATH;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    await mkdir(bin);
+    await mkdir(join(workspace, '.beads'), { recursive: true });
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst cp=require('node:child_process'); const result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nif (process.argv.includes('--version')) process.stdout.write('bd version 1.3.2\\n'); else process.stdout.write('');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    const service = new ProjectAccess(fixtureHost(
+      [{ id: 'remote', name: 'Remote', path: workspace, hostId: 'ssh:server' }],
+      { remoteHosts: JSON.stringify({ 'ssh:server': { destination: 'fixture', name: 'Dev' } }) },
+    ));
+    const report = await service.request({ method: 'ssh.test', project: 'remote' }) as { ok: boolean; checks: { name: string; ok: boolean; detail: string }[] };
+    assert.equal(report.ok, true);
+    assert.equal(report.checks.find((check) => check.name === 'bd')?.ok, true);
+    assert.match(report.checks.find((check) => check.name === 'bd version')?.detail ?? '', /1\.3\.2/);
+    assert.equal(report.checks.find((check) => check.name === 'python3')?.ok, true);
+    assert.match(report.checks.find((check) => check.name === '.beads')?.detail ?? '', /ok /);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('SSH workspaces take the Orca host-list name as the default alias, and remoteHosts overrides it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'beads-alias-'));
+  const previousPath = process.env.PATH;
+  const previousCli = process.env.ORCA_CLI_COMMAND;
+  try {
+    const bin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const calls = join(root, 'host-list-calls');
+    const sshArgs = join(root, 'ssh-args.json');
+    const configFile = join(root, 'other-config');
+    await mkdir(bin);
+    await mkdir(join(workspace, '.beads'), { recursive: true });
+    await writeFile(configFile, 'Host override\n  HostName 127.0.0.1\n');
+    const hosts = {
+      hosts: [
+        { kind: 'ssh', id: 'ssh target', name: 'new_sls' },
+        { kind: 'ssh', id: 'renamed', name: 'Not An Alias' },
+        { kind: 'ssh', id: 'kept', name: 'mini' },
+        { kind: 'ssh', id: 'dup', name: 'one' },
+        { kind: 'ssh', id: 'dup', name: 'two' },
+        { kind: 'local', id: 'local', name: 'This computer' },
+      ],
+    };
+    await writeFile(join(bin, 'orca'), `#!${process.execPath}\nconst fs=require('node:fs');\nconst n=fs.existsSync(${JSON.stringify(calls)})?Number(fs.readFileSync(${JSON.stringify(calls)},'utf8')):0;\nfs.writeFileSync(${JSON.stringify(calls)},String(n+1));\nprocess.stdout.write(JSON.stringify({ok:true,result:${JSON.stringify(hosts)}}));\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'ssh'), `#!${process.execPath}\nconst fs=require('node:fs'); const cp=require('node:child_process');\nfs.writeFileSync(${JSON.stringify(sshArgs)},JSON.stringify(process.argv.slice(2)));\nconst result=cp.spawnSync('/bin/sh',['-c',process.argv.at(-1)],{stdio:'inherit',env:process.env}); process.exit(result.status ?? 1);\n`, { mode: 0o755 });
+    await writeFile(join(bin, 'bd'), `#!${process.execPath}\nprocess.stdout.write('[]');\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
+    process.env.ORCA_CLI_COMMAND = join(bin, 'orca');
+    const encoded = `ssh:${encodeURIComponent('ssh target')}`;
+    const service = new ProjectAccess(fixtureHost([
+      { id: 'local', name: 'Local', path: workspace, hostId: null },
+      { id: 'auto', name: 'Auto', path: workspace, hostId: encoded },
+      { id: 'renamed', name: 'Renamed', path: workspace, hostId: 'ssh:renamed' },
+      { id: 'dup', name: 'Dup', path: workspace, hostId: 'ssh:dup' },
+      { id: 'kept', name: 'Kept', path: workspace, hostId: 'ssh:kept' },
+    ], {
+      remoteHosts: JSON.stringify({ 'ssh:kept': { destination: 'override', configFile, name: 'Override label' } }),
+    }));
+    const projects = await service.list();
+    assert.equal(projects.find((project) => project.id === 'local')?.availability, 'unknown');
+    assert.equal(projects.find((project) => project.id === 'auto')?.hostName, 'new_sls');
+    assert.equal(projects.find((project) => project.id === 'auto')?.availability, 'unknown');
+    assert.match(projects.find((project) => project.id === 'renamed')?.availabilityReason ?? '', /Not An Alias/);
+    assert.equal(projects.find((project) => project.id === 'dup')?.availability, 'unsupported');
+    assert.equal(projects.find((project) => project.id === 'kept')?.hostName, 'Override label');
+    await service.list();
+    assert.equal(await readFile(calls, 'utf8'), '1');
+    await service.request({ method: 'snapshot', project: 'auto' });
+    const autoArgs = JSON.parse(await readFile(sshArgs, 'utf8')) as string[];
+    assert.equal(autoArgs.includes('-F'), false);
+    assert.equal(autoArgs.includes('new_sls'), true);
+    await service.request({ method: 'snapshot', project: 'kept' });
+    const overrideArgs = JSON.parse(await readFile(sshArgs, 'utf8')) as string[];
+    assert.equal(overrideArgs[overrideArgs.indexOf('-F') + 1], configFile);
+    assert.equal(overrideArgs.includes('override'), true);
+    assert.equal(overrideArgs.includes('mini'), false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousCli === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previousCli;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a missing Orca CLI does not drop local projects', async () => {
+  const previousCli = process.env.ORCA_CLI_COMMAND;
+  const root = await mkdtemp(join(tmpdir(), 'beads-no-cli-'));
+  process.env.ORCA_CLI_COMMAND = '/no/such/orca-host-list';
+  try {
+    await mkdir(join(root, '.beads'));
+    const access = new ProjectAccess(fixtureHost([
+      { id: 'local', name: 'Local', path: root, hostId: null },
+      { id: 'ssh', name: 'Remote', path: root, hostId: 'ssh:missing' },
+    ]));
+    const projects = await access.list();
+    assert.equal(projects[0]?.id, 'local');
+    assert.equal(projects[0]?.availability, 'unknown');
+    assert.equal(projects[1]?.availability, 'unsupported');
+    assert.match(projects[1]?.availabilityReason ?? '', /Unsupported host ssh:missing/);
+    assert.match(projects[1]?.availabilityReason ?? '', /Could not read Orca SSH hosts/);
+  } finally {
+    if (previousCli === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previousCli;
     await rm(root, { recursive: true, force: true });
   }
 });

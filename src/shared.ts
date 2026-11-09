@@ -9,6 +9,8 @@ export interface Project {
   hostName?: string;
   /** Null for an additional local path which is not an Orca workspace. */
   workspaceId?: string | null;
+  /** Git branch. Null for a folder workspace or an extra local path. */
+  branch?: string | null;
   /** Omitted when the focused workspace cannot be identified unambiguously. */
   current?: boolean;
   availability?: ProjectAvailability;
@@ -54,6 +56,8 @@ export interface RpcRequest {
   method: string;
   project?: string;
   input?: Record<string, unknown>;
+  /** BCP-47 tag from the panel. Absent requests stay in English. */
+  locale?: string;
 }
 
 export interface Transport {

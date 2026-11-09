@@ -44,7 +44,8 @@ function fixture(hostId = 'local') {
   }, { async readDocument(_project, path) { return { path, text: files.get(path) ?? 'Document', hash: files.get(path) ?? 'Document' }; } }, {
     async run(argv) {
       commands.push(argv);
-      if (argv[0] === 'worktree' && argv[1] === 'show') return { worktree: { id: 'repo::/demo', repoId: 'repo', hostId: 'local', path: '/demo', head: 'base', identity: nativeIdentity } };
+      if (argv[0] === 'worktree' && argv[1] === 'show') return { worktree: { id: 'repo::/demo', repoId: 'repo', hostId: hostId.startsWith('runtime:') ? 'local' : hostId, path: '/demo', head: 'base', identity: nativeIdentity } };
+      if (argv[0] === 'project' && argv[1] === 'setups') return { setups: [{ projectId: 'github:example/demo', repoId: 'repo', hostId, path: '/demo' }] };
       if (argv[0] === 'worktree' && argv[1] === 'create') { effects.push('worktree.create'); return { id: 'repo::/new', path: '/new' }; }
       if (argv[0] === 'terminal' && argv[1] === 'list') return { terminals: [{ handle: 'term:idle', agentIdentity: 'codex', worktreeId: 'repo::/demo', tabId: 'tab', leafId: 'leaf', connected: true }], truncated: false };
       if (argv[0] === 'worktree' && argv[1] === 'ps') return { worktrees: [{ worktreeId: 'repo::/demo', agents: [{ paneKey: 'tab:leaf', state: 'idle' }] }], truncated: false };
@@ -310,6 +311,27 @@ test('history pages expose an explicit cursor instead of dropping older entries'
   assert.equal(second.entries.length, 1);
   assert.equal(second.nextOffset, null);
   assert.equal(new Set([...first.entries, ...second.entries].map((entry) => entry.id)).size, 3);
+});
+
+test('a bare ssh host refuses agent launch and worktree creation', async () => {
+  const f = fixture('ssh:ssh-demo');
+  await assert.rejects(f.service.request({ method: 'worktree.preview', input: { project: 'source', name: 'Feature', branch: 'feature/ssh' } }), /ssh:/);
+  await assert.rejects(f.service.request({ method: 'handoff.preview', input: { groups: [f.group] } }), /ssh:/);
+  assert.equal(f.commands.some((argv) => argv.includes('--host')), false);
+});
+
+test('runtime handoff uses the server environment and a path selector', async () => {
+  const f = fixture('runtime:mini');
+  const preview = await f.service.request({ method: 'worktree.preview', input: { project: 'source', name: 'Feature', branch: 'feature/ssh' } }) as WorktreePreview;
+  assert.equal(preview.argv.includes('--host'), false);
+  assert.equal(preview.argv[preview.argv.indexOf('--environment') + 1], 'mini');
+  const [handoff] = await f.service.request({ method: 'handoff.preview', input: { groups: [f.group] } }) as HandoffPreview[];
+  assert.equal(handoff.errors.length, 0);
+  await f.service.request({ method: 'handoff.send', input: { id: handoff.id } });
+  const launch = f.commands.find((argv) => argv[0] === 'agent');
+  assert.equal(launch?.includes('--host'), false);
+  assert.equal(launch?.[launch.indexOf('--environment') + 1], 'mini');
+  assert.equal(launch?.[launch.indexOf('--worktree') + 1], 'path:/demo');
 });
 
 test('explicitly mapped paired targets use the selected native environment, never the local runtime target', async () => {

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.5-ssh.8 — 2026-11-09
+
+- Reopening the panel follows the focused Orca workspace, including an SSH worktree, using its name, branch, and terminal path. A local folder such as Documents is not chosen while that workspace is focused.
+- Workspaces without a `.beads` directory are left out of the list. If the focused workspace is not initialized, the panel uses another initialized workspace instead.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.7 — 2026-11-09
+
+- Reopening the panel selects the workspace Orca currently has focused. The last manual choice is used only when that focus is missing or matches more than one workspace.
+- New CLI sessions offer Grok, Claude, Codex, Qoder CLI, OMP, Antigravity, Cursor, and Droid, using each tool's real binary name. Amp is not listed.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.6 — 2026-11-09
+
+- The Simplified Chinese label for Beads type `epic` is 需求. Section headers, search, filters, and empty states use the same word. The value sent to `bd` stays `epic`.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.5 — 2026-11-09
+
+- Remaining panel chrome is Simplified Chinese: issue types, statuses, relationships, filters, empty states, buttons, and the errors the panel shows. Values sent to `bd` stay the English keys.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.4 — 2026-11-09
+
+- When Orca exposes `fork.host.exec`, Beads on a paired `runtime:` server runs through that API (`argv`, no shell) instead of a second SSH login. `fork.workspaces.list` discovers those workspaces. `remoteHosts` still overrides the destination.
+- If `fork.*` is missing, or the paired server does not implement it yet, the plugin keeps the system SSH path, including the `~/.ssh/config` alias. A bare `ssh:` host is not used for agent launch.
+- Runtime handoff uses `orca agent launch --environment <envId>` and a `path:` worktree selector.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.3-zh — 2026-11-09
+
+- The panel, settings labels, and the errors a person sees are Simplified Chinese when Orca's UI language is Chinese or unset.
+- Orca's UI language (`orca.locale`) selects the copy. English, and Traditional Chinese, keep the English strings. `hostId`, `bd`, `orca`, and JSON keys stay as they are.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.2 — 2026-11-09
+
+- SSH workspaces whose Orca host name is a `~/.ssh/config` Host alias connect without `remoteHosts`. The plugin reads `orca host list` and uses that name as `ssh` destination, with no `-F`, so OpenSSH reads the default config.
+- `remoteHosts` remains an override for a renamed Orca host, a different destination, or another config file. Paired `runtime:` hosts still need an explicit entry.
+- `engines.orca` stays `>=1.4.250`.
+
+## 0.2.5-ssh.1 — 2026-11-09
+
+- Remote Beads commands now start with `env bash --noprofile --norc` and a configurable PATH, so a login shell (`fish`, `zsh`, or `.bashrc`) cannot alias or wrap `bd` and `python3`.
+- `.beads` must stay inside the workspace after `pwd -P`. A symlink to another database is refused locally and over SSH.
+- SSH worktree creation uses `orca worktree create --project <id> --host ssh:…`. `agent launch` does not gain `--host`, because Orca 1.4.250 and the current quzard/orca-fork reject that flag; launch still requires `worktree show` to report the same host and path.
+- SSH calls share a plugin-owned `ControlMaster` socket. The default refresh is 60 seconds when a remote host is configured, and the remote command budget is 60 seconds. Both are settings.
+- Authentication, reachability, missing bash, missing `bd`, missing `python3`, a missing `.beads`, and a `.beads` outside the workspace are separate errors.
+- One bad line in additional project paths is skipped and reported. The other workspaces still load.
+- Hosts in the panel can test an SSH mapping and copy a `remoteHosts` snippet for an unmapped host. The plugin id stays `beads`.
+
 ## 0.2.4 — 2026-11-07
 
 - Replaced text-only project/issue loading screens with layout-aware board and table skeletons in the existing warm monochrome palette.
